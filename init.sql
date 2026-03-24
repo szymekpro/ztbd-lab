@@ -30,10 +30,8 @@ CREATE TABLE IF NOT EXISTS markets (
 
 CREATE TABLE IF NOT EXISTS artists (
   artist_id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-  spotify_artist_id  VARCHAR(22) UNIQUE,
   name               VARCHAR(255) NOT NULL,
   raw_genres_text    VARCHAR(500),
-  country            VARCHAR(80),
   created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at         TIMESTAMPTZ
 );
@@ -46,9 +44,7 @@ CREATE TABLE IF NOT EXISTS albums (
   name                   VARCHAR(255) NOT NULL,
   album_type             VARCHAR(30),
   release_date           DATE,
-  release_date_precision VARCHAR(10),
   total_tracks           INT,
-  label                  VARCHAR(255),
   created_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at             TIMESTAMPTZ
 );
@@ -61,11 +57,10 @@ CREATE TABLE IF NOT EXISTS tracks (
   spotify_track_id VARCHAR(22) NOT NULL UNIQUE,
   name             VARCHAR(255) NOT NULL,
   explicit         BOOLEAN,
-  duration_ms      INT,
+  duration_min     NUMERIC(6,3),
   disc_number      SMALLINT,
   track_number     SMALLINT,
   isrc             VARCHAR(15) UNIQUE,
-  preview_url      VARCHAR(500),
   created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at       TIMESTAMPTZ
 );
@@ -89,7 +84,6 @@ CREATE TABLE IF NOT EXISTS artist_genres (
 CREATE TABLE IF NOT EXISTS album_artists (
   album_id     BIGINT NOT NULL,
   artist_id    BIGINT NOT NULL,
-  role         VARCHAR(30),
   artist_order SMALLINT,
   PRIMARY KEY (album_id, artist_id),
   CONSTRAINT fk_album_artists_album
@@ -101,7 +95,6 @@ CREATE TABLE IF NOT EXISTS album_artists (
 CREATE TABLE IF NOT EXISTS track_artists (
   track_id     BIGINT NOT NULL,
   artist_id    BIGINT NOT NULL,
-  role         VARCHAR(30),
   artist_order SMALLINT,
   PRIMARY KEY (track_id, artist_id),
   CONSTRAINT fk_track_artists_track
