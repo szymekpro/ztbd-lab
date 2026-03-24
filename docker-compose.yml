@@ -1,0 +1,17 @@
+services:
+  db:
+    image: postgres:16
+    container_name: spotify-postgres
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: user
+      POSTGRES_DB: user
+    ports:
+      - "5434:5432" #5432
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/001_init_spotify_schema.sql:ro
+    restart: unless-stopped
+
+volumes:
+  pgdata:
