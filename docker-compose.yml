@@ -10,8 +10,67 @@ services:
       - "5434:5432" #5432
     volumes:
       - pgdata:/var/lib/postgresql/data
-      - ./init.sql:/docker-entrypoint-initdb.d/001_init_spotify_schema.sql:ro
+      - ./init.postgres.sql:/docker-entrypoint-initdb.d/001_init_spotify_schema.sql:ro
     restart: unless-stopped
+
+  mariadb:
+    image: mariadb:11
+    container_name: spotify-mariadb
+    environment:
+      MARIADB_ROOT_PASSWORD: root
+      MARIADB_DATABASE: spotify
+      MARIADB_USER: user
+      MARIADB_PASSWORD: user
+    ports:
+      - "3307:3306"
+    volumes:
+      - mariadb_data:/var/lib/mysql
+      - ./init.mariadb.sql:/docker-entrypoint-initdb.d/001_init_spotify_schema.sql:ro
+    restart: unless-stopped
+
+  mongodb:
+    image: mongo:7
+    container_name: spotify-mongodb
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: spotify
+      MONGO_INITDB_ROOT_PASSWORD: spotify
+      MONGO_INITDB_DATABASE: spotify
+    ports:
+      - "27018:27017"
+    volumes:
+      - mongodb_data:/data/db
+      - ./init.mongo.js:/docker-entrypoint-initdb.d/001_init_spotify_schema.js:ro
+    restart: unless-stopped
+
+  cassandra:
+    image: cassandra:5.0
+    container_name: spotify-cassandra
+    ports:
+      - "9043:9042"
+    volumes:
+      - cassandra_data:/var/lib/cassandra
+    healthcheck:
+      test: ["CMD-SHELL", "cqlsh localhost 9042 -e 'DESCRIBE KEYSPACES' >/dev/null 2>&1"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 60s
+    restart: unless-stopped
+
+  cassandra-init:
+    image: cassandra:5.0
+    container_name: spotify-cassandra-init
+    depends_on:
+      cassandra:
+        condition: service_healthy
+    volumes:
+      - ./init.cassandra.cql:/init/init.cassandra.cql:ro
+      - ./init.cassandra.sh:/init/init.cassandra.sh:ro
+    command: ["sh", "/init/init.cassandra.sh"]
+    restart: "no"
 
 volumes:
   pgdata:
+  mariadb_data:
+  mongodb_data:
+  cassandra_data:
