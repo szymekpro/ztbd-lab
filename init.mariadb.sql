@@ -39,7 +39,7 @@ CREATE INDEX IF NOT EXISTS idx_artists_name ON artists (name);
 
 CREATE TABLE IF NOT EXISTS albums (
   album_id               BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
-  spotify_album_id       VARCHAR(22) UNIQUE,
+  spotify_album_id       VARCHAR(22) CHARACTER SET ascii COLLATE ascii_bin UNIQUE,
   name                   VARCHAR(255) NOT NULL,
   album_type             VARCHAR(30),
   release_date           DATE,
@@ -53,7 +53,7 @@ CREATE INDEX IF NOT EXISTS idx_albums_release_date ON albums (release_date);
 
 CREATE TABLE IF NOT EXISTS tracks (
   track_id         BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
-  spotify_track_id VARCHAR(22) NOT NULL UNIQUE,
+  spotify_track_id VARCHAR(22) CHARACTER SET ascii COLLATE ascii_bin NOT NULL UNIQUE,
   name             VARCHAR(255) NOT NULL,
   explicit         BOOLEAN,
   duration_min     DECIMAL(6,3),
