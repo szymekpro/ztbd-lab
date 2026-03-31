@@ -2,3 +2,5 @@ psycopg[binary]>=3.1
 Faker>=24.0
 PyMySQL>=1.1
 pymongo>=4.6
+cassandra-driver>=3.29
+pyasyncore>=1.0.5

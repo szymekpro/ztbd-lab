@@ -8,3 +8,13 @@
 
 ### Run seeding for mariadb
 ```py seed_mariadb_faker_data.py --truncate --genres 20 --artists 50 --albums 80 --tracks 1000000 --seed 1```
+
+### Run seeding for cassandra
+```py seed_cassandra_faker_data.py --truncate --genres 20 --artists 50 --albums 80 --tracks 1000000 --seed 1```
+
+### Faster seeding for cassandra (large loads)
+```py seed_cassandra_faker_data.py --truncate --genres 20 --artists 50 --albums 80 --tracks 1000000 --seed 1 --write-concurrency 300 --write-chunk-size 20000 --progress-every 200000```
+
+### Fast mode (quick stress dataset)
+```py seed_cassandra_faker_data.py --truncate --genres 20 --artists 50 --albums 80 --tracks 1000000 --seed 1 --fast```
+
