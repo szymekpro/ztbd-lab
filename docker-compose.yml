@@ -3,9 +3,9 @@ services:
     image: postgres:16
     container_name: spotify-postgres
     environment:
-      POSTGRES_USER: user
-      POSTGRES_PASSWORD: user
-      POSTGRES_DB: user
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: pass
+      POSTGRES_DB: spotify_db
     ports:
       - "5434:5432" #5432
     volumes:

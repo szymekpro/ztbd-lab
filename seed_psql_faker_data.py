@@ -455,7 +455,7 @@ def main() -> int:
     )
 
     parser.add_argument("--db-host", default=os.getenv("DB_HOST", "localhost"))
-    parser.add_argument("--db-port", type=int, default=int(os.getenv("DB_PORT", "5432")))
+    parser.add_argument("--db-port", type=int, default=int(os.getenv("DB_PORT", "5434")))
     parser.add_argument("--db-name", default=os.getenv("DB_NAME", "spotify_db"))
     parser.add_argument("--db-user", default=os.getenv("DB_USER", "postgres"))
     parser.add_argument("--db-password", default=os.getenv("DB_PASSWORD", "pass"))
