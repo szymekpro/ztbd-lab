@@ -10,13 +10,14 @@ Scenariusze:
   6. range_query           – albumy z release_date 2015-2020
 
 Uruchomienie (z katalogu postgres/):
-  python benchmark_psql_read_scenarios.py --scales 500000,1000000 --no-indexes
-  python benchmark_psql_read_scenarios.py --scales 500000,1000000
+    python benchmark_psql_read_scenarios.py --scales 500000,1000000,10000000 --both-index-modes
+    python benchmark_psql_read_scenarios.py --scales 1000000 --no-indexes
 """
 
 import argparse
 import os
 import random
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -49,6 +50,24 @@ def connect_db(cfg: DbConfig) -> psycopg.Connection:
     )
     conn.execute("SET search_path TO spotify, public;")
     return conn
+
+
+def ensure_existing_schema(conn: psycopg.Connection) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT count(*)
+            FROM information_schema.tables
+            WHERE table_schema = 'spotify'
+              AND table_name IN ('artists', 'albums', 'tracks', 'track_artists', 'track_albums')
+            """
+        )
+        found = int(cur.fetchone()[0])
+        if found < 5:
+            raise RuntimeError(
+                "Required spotify schema/tables not found. Run init.postgres.sql first."
+            )
+    conn.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -112,6 +131,62 @@ def apply_indexes(conn: psycopg.Connection, with_indexes: bool) -> None:
 
 
 # ---------------------------------------------------------------------------
+# SCALE / SEEDING
+# ---------------------------------------------------------------------------
+
+def parse_scales(scales_str: str) -> list[int]:
+    parts = [p.strip() for p in scales_str.split(",") if p.strip()]
+    scales: list[int] = []
+    for p in parts:
+        val = int(p)
+        if val <= 0:
+            raise ValueError("All scales must be positive")
+        scales.append(val)
+    if not scales:
+        raise ValueError("No scales provided")
+    return scales
+
+
+def _scaled_count(scale: int, fraction: float, *, min_count: int, max_count: int) -> int:
+    if scale <= 0:
+        return min_count
+    return max(min_count, min(int(scale * fraction), max_count))
+
+
+def prepare_scale_data_with_seed_script(
+    cfg: DbConfig,
+    target_rows: int,
+    seed_value: Optional[int],
+    pool_size: int,
+) -> None:
+    from pathlib import Path
+
+    # Make import work regardless of cwd (root/ vs postgres/)
+    repo_root = Path(__file__).resolve().parents[1]
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+
+    import seed_psql_faker_data as seed_script
+
+    seed_cfg = seed_script.DbConfig(
+        host=cfg.host,
+        port=cfg.port,
+        dbname=cfg.dbname,
+        user=cfg.user,
+        password=cfg.password,
+    )
+
+    print(f"\n[PREP] Seed danych do skali: {target_rows:,} tracks (truncate=True)")
+    seed_script.seed_all(
+        cfg=seed_cfg,
+        target_tracks=target_rows,
+        seed=seed_value,
+        truncate=True,
+        pool_size=pool_size,
+    )
+
+
+# ---------------------------------------------------------------------------
 # SAMPLE ID FETCHING
 # ---------------------------------------------------------------------------
 
@@ -159,6 +234,20 @@ def fetch_sample_ids(conn: psycopg.Connection) -> dict:
         rows = cur.fetchall()
         samples["chart_date_pairs"] = [(r[0], r[1]) for r in rows] if rows else [(1, "2024-01-01")]
 
+        # random chart ids (for scaled chart reads across many dates)
+        cur.execute(
+            """
+            SELECT chart_id, COUNT(*) AS cnt
+            FROM chart_entries
+            GROUP BY chart_id
+            HAVING COUNT(*) >= 500
+            ORDER BY random()
+            LIMIT 10
+            """
+        )
+        rows = cur.fetchall()
+        samples["chart_ids"] = [r[0] for r in rows] if rows else [1]
+
         # random artist with audio_features data
         cur.execute(
             """
@@ -179,6 +268,7 @@ def fetch_sample_ids(conn: psycopg.Connection) -> dict:
     print(f"  track_ids:        {len(samples['track_ids'])} sztuk")
     print(f"  album_ids:        {len(samples['album_ids'])} sztuk")
     print(f"  chart_date_pairs: {len(samples['chart_date_pairs'])} sztuk")
+    print(f"  chart_ids:        {len(samples['chart_ids'])} sztuk")
     print(f"  artist_ids:       {len(samples['artist_ids'])} sztuk")
     return samples
 
@@ -231,12 +321,15 @@ def scenario_partition_read(conn: psycopg.Connection, samples: dict) -> int:
     return len(rows)
 
 
-def scenario_top_n_ranking(conn: psycopg.Connection, samples: dict) -> int:
+def scenario_top_n_ranking_scaled(conn: psycopg.Connection, samples: dict, scale: int) -> int:
     """
-    S3 – Top-N Ranking: Top 50 notowań dla wybranego chart + date.
+    S3 – Top-N Ranking (scaled): pobierz Top-N wpisów dla wybranego chart_id
+    (przez wiele dni), żeby ilość pracy rosła ze skalą.
+
     Korzysta z idx_chart_entries_chart_date.
     """
-    chart_id, chart_date = random.choice(samples["chart_date_pairs"])
+    chart_id = random.choice(samples["chart_ids"])
+    limit_n = _scaled_count(scale, 0.00005, min_count=50, max_count=10_000)
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -245,30 +338,31 @@ def scenario_top_n_ranking(conn: psycopg.Connection, samples: dict) -> int:
             FROM chart_entries ce
             JOIN tracks t ON t.track_id = ce.track_id
             WHERE ce.chart_id = %s
-              AND ce.chart_date = %s
-            ORDER BY ce.position
-            LIMIT 50
+            ORDER BY ce.chart_date DESC, ce.position
+            LIMIT %s
             """,
-            (chart_id, chart_date),
+            (chart_id, limit_n),
         )
         rows = cur.fetchall()
     conn.commit()
     return len(rows)
 
 
-def scenario_secondary_index_read(conn: psycopg.Connection, _samples: dict) -> int:
+def scenario_secondary_index_read_scaled(conn: psycopg.Connection, _samples: dict, scale: int) -> int:
     """
-    S4 – Secondary Index Read: znajdź 1000 utworów z explicit=true.
+    S4 – Secondary Index Read (scaled): znajdź N utworów z explicit=true.
     Bez indeksu: seq scan. Z idx_tracks_explicit: index scan.
     """
+    limit_n = _scaled_count(scale, 0.001, min_count=1_000, max_count=50_000)
     with conn.cursor() as cur:
         cur.execute(
             """
             SELECT track_id, name, duration_min
             FROM tracks
             WHERE explicit = true
-            LIMIT 1000
+            LIMIT %s
             """,
+            (limit_n,),
         )
         rows = cur.fetchall()
     conn.commit()
@@ -300,11 +394,12 @@ def scenario_local_aggregation(conn: psycopg.Connection, samples: dict) -> int:
     return 1  # single aggregate row
 
 
-def scenario_range_query(conn: psycopg.Connection, _samples: dict) -> int:
+def scenario_range_query_scaled(conn: psycopg.Connection, _samples: dict, scale: int) -> int:
     """
-    S6 – Range Query: albumy wydane w latach 2015–2020.
+    S6 – Range Query (scaled): albumy wydane w latach 2015–2020 (LIMIT rośnie ze skalą).
     Korzysta z idx_albums_release_date.
     """
+    limit_n = _scaled_count(scale, 0.0002, min_count=2_000, max_count=100_000)
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -312,7 +407,9 @@ def scenario_range_query(conn: psycopg.Connection, _samples: dict) -> int:
             FROM albums
             WHERE release_date BETWEEN '2015-01-01' AND '2020-12-31'
             ORDER BY release_date
+            LIMIT %s
             """,
+            (limit_n,),
         )
         rows = cur.fetchall()
     conn.commit()
@@ -332,65 +429,84 @@ def timed_run(fn, *args, **kwargs) -> tuple[float, int]:
 
 def run_benchmark(
     cfg: DbConfig,
+    scales: list[int],
     runs_per_scenario: int,
-    with_indexes: bool,
+    skip_prepare: bool,
+    seed_value: Optional[int],
+    pool_size: int,
+    index_modes: list[bool],
 ) -> list[dict]:
     results: list[dict] = []
 
-    with connect_db(cfg) as conn:
-        apply_indexes(conn, with_indexes)
-        samples = fetch_sample_ids(conn)
+    if not index_modes:
+        raise ValueError("index_modes must not be empty")
 
-        index_label = "with_indexes" if with_indexes else "no_indexes"
+    for scale in scales:
+        if not skip_prepare:
+            prepare_scale_data_with_seed_script(
+                cfg=cfg,
+                target_rows=scale,
+                seed_value=seed_value,
+                pool_size=pool_size,
+            )
 
-        scenarios = [
-            ("point_read",            lambda: scenario_point_read(conn, samples)),
-            ("partition_read",        lambda: scenario_partition_read(conn, samples)),
-            ("top_n_ranking",         lambda: scenario_top_n_ranking(conn, samples)),
-            ("secondary_index_read",  lambda: scenario_secondary_index_read(conn, samples)),
-            ("local_aggregation",     lambda: scenario_local_aggregation(conn, samples)),
-            ("range_query",           lambda: scenario_range_query(conn, samples)),
-        ]
+        with connect_db(cfg) as conn:
+            ensure_existing_schema(conn)
+            samples = fetch_sample_ids(conn)
 
-        for scenario_name, scenario_fn in scenarios:
-            for run_idx in range(1, runs_per_scenario + 1):
-                elapsed, ops = timed_run(scenario_fn)
-                results.append(
-                    {
-                        "index_mode": index_label,
-                        "scenario": scenario_name,
-                        "run": run_idx,
-                        "seconds": elapsed,
-                        "rows_returned": ops,
-                        "rows_per_sec": (ops / elapsed) if elapsed > 0 else None,
-                    }
-                )
+            for with_indexes in index_modes:
+                apply_indexes(conn, with_indexes)
+                index_label = "with_indexes" if with_indexes else "no_indexes"
+
+                scenarios = [
+                    ("point_read",            lambda: scenario_point_read(conn, samples)),
+                    ("partition_read",        lambda: scenario_partition_read(conn, samples)),
+                    ("top_n_ranking",         lambda: scenario_top_n_ranking_scaled(conn, samples, scale=scale)),
+                    ("secondary_index_read",  lambda: scenario_secondary_index_read_scaled(conn, samples, scale=scale)),
+                    ("local_aggregation",     lambda: scenario_local_aggregation(conn, samples)),
+                    ("range_query",           lambda: scenario_range_query_scaled(conn, samples, scale=scale)),
+                ]
+
+                for scenario_name, scenario_fn in scenarios:
+                    for run_idx in range(1, runs_per_scenario + 1):
+                        elapsed, ops = timed_run(scenario_fn)
+                        results.append(
+                            {
+                                "scale": scale,
+                                "index_mode": index_label,
+                                "scenario": scenario_name,
+                                "run": run_idx,
+                                "seconds": elapsed,
+                                "rows_returned": ops,
+                                "rows_per_sec": (ops / elapsed) if elapsed > 0 else None,
+                            }
+                        )
 
     return results
 
 
 def print_summary(results: list[dict]) -> None:
-    groups: dict[tuple[str, str], list[dict]] = {}
+    groups: dict[tuple[int, str, str], list[dict]] = {}
     for row in results:
-        key = (row["index_mode"], row["scenario"])
+        key = (row.get("scale", 0), row["index_mode"], row["scenario"])
         groups.setdefault(key, []).append(row)
 
     print("\n=== READ Benchmark Summary (avg z prób) ===")
-    print(f"{'index_mode':<15} {'scenario':<25} {'avg_sec':>10} {'avg_rows/s':>12}")
-    print("-" * 65)
+    print(f"{'scale':>10} {'index_mode':<15} {'scenario':<25} {'avg_sec':>10} {'avg_rows/s':>12}")
+    print("-" * 80)
 
-    for (index_mode, scenario), rows in sorted(groups.items()):
+    for (scale, index_mode, scenario), rows in sorted(groups.items()):
         avg_sec = mean(r["seconds"] for r in rows)
         valid_rps = [r["rows_per_sec"] for r in rows if r["rows_per_sec"] is not None]
         avg_rps = mean(valid_rps) if valid_rps else 0.0
-        print(f"{index_mode:<15} {scenario:<25} {avg_sec:>10.6f} {avg_rps:>12.2f}")
+        print(f"{scale:>10,} {index_mode:<15} {scenario:<25} {avg_sec:>10.6f} {avg_rps:>12.2f}")
 
 
 def save_results_csv(results: list[dict], out_path: str) -> None:
     import csv
 
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    fieldnames = ["index_mode", "scenario", "run", "seconds", "rows_returned", "rows_per_sec"]
+    fieldnames = ["scale", "index_mode", "scenario", "run", "seconds", "rows_returned", "rows_per_sec"]
     with open(out_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -406,12 +522,35 @@ def main() -> int:
         description="PostgreSQL READ benchmark – 6 scenariuszy odczytu z porównaniem przed/po indeksach."
     )
 
+    parser.add_argument("--scales", default="500000,1000000,10000000")
     parser.add_argument(
         "--no-indexes",
         action="store_true",
         help="Usuwa zarządzane indeksy przed testem (tryb 'bez indeksów').",
     )
+    parser.add_argument(
+        "--both-index-modes",
+        action="store_true",
+        help="Uruchamia benchmark w dwóch trybach (bez indeksów i z indeksami) i zapisuje do jednego CSV.",
+    )
     parser.add_argument("--runs-per-scenario", type=int, default=3)
+    parser.add_argument(
+        "--seed-value",
+        type=int,
+        default=1,
+        help="Seed dla generatora danych (dla powtarzalności).",
+    )
+    parser.add_argument(
+        "--pool-size",
+        type=int,
+        default=10000,
+        help="Batch size dla seedowania (seed_psql_faker_data.py).",
+    )
+    parser.add_argument(
+        "--skip-prepare",
+        action="store_true",
+        help="Nie seeduje danych do skali przed testami (szybszy dry-run, wymaga ręcznego przygotowania danych).",
+    )
     parser.add_argument("--output", default="results/psql_read_benchmark_results.csv")
 
     parser.add_argument("--db-host",     default=os.getenv("DB_HOST",     "localhost"))
@@ -422,6 +561,13 @@ def main() -> int:
 
     args = parser.parse_args()
 
+    if args.runs_per_scenario <= 0:
+        raise ValueError("runs-per-scenario must be > 0")
+    if args.pool_size <= 0:
+        raise ValueError("pool-size must be > 0")
+
+    scales = parse_scales(args.scales)
+
     cfg = DbConfig(
         host=args.db_host,
         port=args.db_port,
@@ -430,14 +576,24 @@ def main() -> int:
         password=args.db_password,
     )
 
-    with_indexes = not args.no_indexes
-    mode_label = "Z indeksami" if with_indexes else "BEZ indeksów"
+    if args.both_index_modes:
+        index_modes = [False, True]
+        mode_label = "BEZ indeksów + Z indeksami"
+    else:
+        with_indexes = not args.no_indexes
+        index_modes = [with_indexes]
+        mode_label = "Z indeksami" if with_indexes else "BEZ indeksów"
+
     print(f"\n>>> PostgreSQL READ Benchmark – tryb: {mode_label} <<<")
 
     results = run_benchmark(
         cfg=cfg,
+        scales=scales,
         runs_per_scenario=args.runs_per_scenario,
-        with_indexes=with_indexes,
+        skip_prepare=args.skip_prepare,
+        seed_value=args.seed_value,
+        pool_size=args.pool_size,
+        index_modes=index_modes,
     )
 
     save_results_csv(results, args.output)

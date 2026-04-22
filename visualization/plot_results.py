@@ -7,6 +7,7 @@ Wykresy:
   1. INSERT – avg_seconds per scenario (bar chart)
   2. INSERT – ops_per_sec per scenario (bar chart)
   3. INSERT – porównanie 3 skal (grouped bar)
+    3b. READ   – avg_seconds per scenario (grouped bar by scale, with_indexes)
   4. READ   – porównanie przed/po indeksach (grouped bar, avg_seconds)
   5. UPDATE – porównanie przed/po indeksach (grouped bar, avg_seconds)
   6. DELETE – porównanie przed/po indeksach (grouped bar, avg_seconds)
@@ -288,6 +289,70 @@ def plot_delete_time_per_scenario(df: DataFrame, out_dir: Path, dpi: int) -> Non
 
 
 # ---------------------------------------------------------------------------
+# PLOT X: READ – avg time per scenario grouped by scale (like DELETE)
+# ---------------------------------------------------------------------------
+
+def plot_read_time_per_scenario(df: DataFrame, out_dir: Path, dpi: int) -> None:
+    if "scale" not in df.columns:
+        print("  [POMINIĘTO] READ avg time per scenario: brak kolumny 'scale' w CSV")
+        return
+
+    df2 = df.copy()
+    if "index_mode" in df2.columns:
+        if "with_indexes" in set(df2["index_mode"].unique()):
+            df2 = df2[df2["index_mode"] == "with_indexes"].copy()
+
+    agg = df2.groupby(["scale", "scenario"])["seconds"].mean().reset_index()
+    agg.rename(columns={"seconds": "avg_seconds"}, inplace=True)
+
+    scales = sorted(agg["scale"].unique())
+    scenarios = sorted(agg["scenario"].unique())
+    colors = dict(zip(scales, SCALE_PALETTE[: len(scales)]))
+
+    fig, ax = plt.subplots(figsize=(11, 5))
+    x = range(len(scenarios))
+    width = 0.25 if len(scales) <= 3 else max(0.12, 0.8 / len(scales))
+
+    for i, scale in enumerate(scales):
+        vals = [
+            agg[(agg["scale"] == scale) & (agg["scenario"] == s)]["avg_seconds"].values
+            for s in scenarios
+        ]
+        heights = [v[0] if len(v) > 0 else 0 for v in vals]
+        offset = (i - len(scales) / 2 + 0.5) * width
+        bars = ax.bar(
+            [xi + offset for xi in x],
+            heights,
+            width=width,
+            color=colors.get(scale, "#888888"),
+            label=f"scale={int(scale):,}",
+            alpha=0.85,
+            edgecolor="white",
+        )
+        for bar in bars:
+            h = bar.get_height()
+            if h > 0:
+                ax.text(
+                    bar.get_x() + bar.get_width() / 2,
+                    h * 1.02,
+                    f"{h:.4f}s",
+                    ha="center",
+                    va="bottom",
+                    fontsize=7,
+                )
+
+    ax.set_xticks(list(x))
+    ax.set_xticklabels(scenarios, rotation=20, ha="right", fontsize=9)
+    ax.set_ylabel("Średni czas [s]")
+    ax.set_title("READ – Średni czas wykonania per scenariusz (z indeksami)")
+    ax.legend(title="Skala danych")
+    ax.yaxis.set_minor_locator(mticker.AutoMinorLocator())
+    ax.grid(axis="y", alpha=0.4)
+    fig.tight_layout()
+    savefig(fig, out_dir, "read_avg_time_per_scenario.png", dpi)
+
+
+# ---------------------------------------------------------------------------
 # PLOT 3: Before/after index comparison (READ / UPDATE / DELETE)
 # ---------------------------------------------------------------------------
 
@@ -521,6 +586,7 @@ def main() -> int:
     # Keep raw frames for multi-scale plots; create single-scale views for charts that
     # assume one scale (READ/UPDATE/DELETE before-after, speedup, overview).
     insert_df_multi = insert_df
+    read_df_multi = read_df
     delete_df_multi = delete_df
 
     insert_df_single = insert_df
@@ -545,6 +611,10 @@ def main() -> int:
         plot_heatmap(insert_df_single, "INSERT", "seconds", out_dir, args.dpi)
 
     # READ charts
+    if read_df_multi is not None:
+        print("[4/8] READ – czas per scenariusz (skale)")
+        plot_read_time_per_scenario(read_df_multi, out_dir, args.dpi)
+
     if read_df_single is not None:
         print("[4/8] READ – przed/po indeksach")
         plot_before_after_index(read_df_single, "READ", "seconds", out_dir, args.dpi)
