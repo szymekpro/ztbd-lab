@@ -159,9 +159,9 @@ def prepare_scale_data_with_seed_script(
     seed_value: Optional[int],
     pool_size: int,
 ) -> None:
+    import sys
     from pathlib import Path
 
-    # Make import work regardless of cwd (root/ vs postgres/)
     repo_root = Path(__file__).resolve().parents[1]
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
@@ -176,14 +176,19 @@ def prepare_scale_data_with_seed_script(
         password=cfg.password,
     )
 
-    print(f"\n[PREP] Seed danych do skali: {target_rows:,} tracks (truncate=True)")
-    seed_script.seed_all(
-        cfg=seed_cfg,
-        target_tracks=target_rows,
-        seed=seed_value,
-        truncate=True,
-        pool_size=pool_size,
-    )
+    # Build each scale from scratch for reproducible comparisons.
+    with seed_script.connect_db(seed_cfg) as seed_conn:
+        seed_script.seed_all(
+            seed_conn,
+            n_genres=30,
+            n_artists=max(50, target_rows // 20000),
+            n_albums=max(80, target_rows // 10000),
+            n_tracks=target_rows,
+            seed=seed_value,
+            truncate=True,
+            pool_size=pool_size,
+            include_audio_features=False,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -551,7 +556,7 @@ def main() -> int:
         action="store_true",
         help="Nie seeduje danych do skali przed testami (szybszy dry-run, wymaga ręcznego przygotowania danych).",
     )
-    parser.add_argument("--output", default="results/psql_read_benchmark_results.csv")
+    parser.add_argument("--output", default="postgres/results/psql_read_benchmark_results.csv")
 
     parser.add_argument("--db-host",     default=os.getenv("DB_HOST",     "localhost"))
     parser.add_argument("--db-port",     type=int, default=int(os.getenv("DB_PORT", "5434")))

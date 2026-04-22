@@ -638,7 +638,7 @@ def main() -> int:
         action="store_true",
         help="Nie prefilluje danych do skali przed testami (szybszy dry-run).",
     )
-    parser.add_argument("--output", default="results/psql_insert_benchmark_results.csv")
+    parser.add_argument("--output", default="postgres/results/psql_insert_benchmark_results.csv")
 
     parser.add_argument("--db-host", default=os.getenv("DB_HOST", "localhost"))
     parser.add_argument("--db-port", type=int, default=int(os.getenv("DB_PORT", "5434")))
@@ -660,11 +660,6 @@ def main() -> int:
         raise ValueError("concurrent-chunk-size must be > 0")
     if args.pool_size <= 0:
         raise ValueError("pool-size must be > 0")
-
-    print(
-        "Info: Heavy payload scenario uses a fixed batch of artists plus artist_genres links; "
-        "artists.raw_genres_text still caps the per-row text at 500 chars."
-    )
 
     if args.both_index_modes:
         index_modes = [False, True]

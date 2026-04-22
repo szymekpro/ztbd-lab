@@ -130,6 +130,7 @@ def prepare_scale_data_with_seed_script(
             seed=seed_value,
             truncate=True,
             pool_size=pool_size,
+            include_audio_features=False,
         )
 
 

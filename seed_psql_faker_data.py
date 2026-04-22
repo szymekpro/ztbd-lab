@@ -406,6 +406,7 @@ def seed_all(
     seed: Optional[int] = None,
     truncate: bool = False,
     pool_size: int = 1000,
+    include_audio_features: bool = True,
 ) -> None:
     fake = Faker()
     if seed is not None:
@@ -422,7 +423,8 @@ def seed_all(
     seed_tracks(conn, fake, n=n_tracks, pool_size=pool_size, seed=seed)
 
     seed_relations_fast(conn)
-    seed_audio_features_fast(conn)
+    if include_audio_features:
+        seed_audio_features_fast(conn)
 
     # Charts are tiny; keep simple row-by-row approach.
     with conn.cursor() as cur:
@@ -453,6 +455,11 @@ def main() -> int:
         default=10000,
         help="Size of Faker-generated name pools (higher = more variety, slower startup)",
     )
+    parser.add_argument(
+        "--skip-audio-features",
+        action="store_true",
+        help="Skip seeding spotify.audio_features (faster; only use if your benchmarks don't need it)",
+    )
 
     parser.add_argument("--db-host", default=os.getenv("DB_HOST", "localhost"))
     parser.add_argument("--db-port", type=int, default=int(os.getenv("DB_PORT", "5434")))
@@ -480,6 +487,7 @@ def main() -> int:
             seed=args.seed,
             truncate=args.truncate,
             pool_size=args.pool_size,
+            include_audio_features=not args.skip_audio_features,
         )
 
     print("Seeding completed.")
