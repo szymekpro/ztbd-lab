@@ -142,7 +142,12 @@ def _rotate_labels(ax: Axes, angle: int = 25) -> None:
 # ---------------------------------------------------------------------------
 
 def plot_insert_time_per_scenario(df: DataFrame, out_dir: Path, dpi: int) -> None:
-    agg = df.groupby(["scale", "scenario"])["seconds"].mean().reset_index()
+    df2 = df.copy()
+    if "index_mode" in df2.columns:
+        if "with_indexes" in set(df2["index_mode"].unique()):
+            df2 = df2[df2["index_mode"] == "with_indexes"].copy()
+
+    agg = df2.groupby(["scale", "scenario"])["seconds"].mean().reset_index()
     agg.rename(columns={"seconds": "avg_seconds"}, inplace=True)
 
     scales = sorted(agg["scale"].unique())
@@ -179,7 +184,12 @@ def plot_insert_time_per_scenario(df: DataFrame, out_dir: Path, dpi: int) -> Non
 
 
 def plot_insert_ops_per_sec(df: DataFrame, out_dir: Path, dpi: int) -> None:
-    df2 = df[df["ops_per_sec"].notna()].copy()
+    df2 = df.copy()
+    if "index_mode" in df2.columns:
+        if "with_indexes" in set(df2["index_mode"].unique()):
+            df2 = df2[df2["index_mode"] == "with_indexes"].copy()
+
+    df2 = df2[df2["ops_per_sec"].notna()].copy()
     agg = df2.groupby(["scale", "scenario"])["ops_per_sec"].mean().reset_index()
 
     scales = sorted(agg["scale"].unique())
@@ -391,9 +401,12 @@ def plot_all_scenarios_overview(
     rows = []
 
     if insert_df is not None:
-        # INSERT – use largest available scale, with no index_mode column
-        max_scale = insert_df["scale"].max()
-        agg = insert_df[insert_df["scale"] == max_scale].groupby("scenario")["seconds"].mean()
+        # INSERT – use with_indexes if available, and largest available scale
+        df2 = insert_df
+        if "index_mode" in df2.columns and "with_indexes" in set(df2["index_mode"].unique()):
+            df2 = df2[df2["index_mode"] == "with_indexes"].copy()
+        max_scale = df2["scale"].max()
+        agg = df2[df2["scale"] == max_scale].groupby("scenario")["seconds"].mean()
         for scenario, avg_s in agg.items():
             rows.append({"crud": "INSERT", "scenario": scenario, "avg_seconds": avg_s})
 
@@ -511,7 +524,7 @@ def main() -> int:
     delete_df_multi = delete_df
 
     insert_df_single = insert_df
-    if insert_df is not None and args.scale is not None:
+    if insert_df is not None:
         insert_df_single = _filter_scale(insert_df, args.scale, "INSERT")
 
     read_df_single = _filter_scale(read_df, args.scale, "READ") if read_df is not None else None
