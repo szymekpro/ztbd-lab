@@ -24,16 +24,47 @@ Flagi:
   --style        styl matplotlib: seaborn-v0_8-whitegrid | ggplot | bmh (domyślnie: seaborn-v0_8-whitegrid)
 """
 
+from __future__ import annotations
+
 import argparse
 import os
 import sys
 from pathlib import Path
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Any
 
-import matplotlib.pyplot as plt
-import matplotlib.ticker as mticker
-import pandas as pd
-import seaborn as sns
+
+def _require_plot_deps():
+    global plt, mticker, pd, sns
+    try:
+        import matplotlib.pyplot as _plt  # type: ignore
+        import matplotlib.ticker as _mticker  # type: ignore
+        import pandas as _pd  # type: ignore
+        import seaborn as _sns  # type: ignore
+    except ModuleNotFoundError as e:
+        missing = getattr(e, "name", "<unknown>")
+        raise SystemExit(
+            "Brak zależności do wykresów (pandas/matplotlib/seaborn).\n"
+            "Zainstaluj je np.:\n"
+            "  pip install pandas matplotlib seaborn\n"
+            f"Brakujący moduł: {missing}"
+        ) from e
+
+    plt = _plt
+    mticker = _mticker
+    pd = _pd
+    sns = _sns
+
+
+# Lazy-loaded plotting deps (set by _require_plot_deps)
+plt = None  # type: ignore
+mticker = None  # type: ignore
+pd = None  # type: ignore
+sns = None  # type: ignore
+
+# Type aliases (avoid referencing lazy globals in annotations)
+DataFrame = Any
+Figure = Any
+Axes = Any
 
 
 # ---------------------------------------------------------------------------
@@ -57,7 +88,7 @@ SCALE_PALETTE = ["#4c78a8", "#72b7b2", "#ff9da6"]
 # HELPERS
 # ---------------------------------------------------------------------------
 
-def load_csv(path: Path) -> Optional[pd.DataFrame]:
+def load_csv(path: Path) -> Optional[DataFrame]:
     if not path.exists():
         print(f"  [POMINIĘTO] brak pliku: {path}")
         return None
@@ -66,14 +97,43 @@ def load_csv(path: Path) -> Optional[pd.DataFrame]:
     return df
 
 
-def savefig(fig: plt.Figure, out_dir: Path, name: str, dpi: int) -> None:
+def _filter_scale(df: DataFrame, scale: Optional[int], label: str) -> DataFrame:
+    if "scale" not in df.columns:
+        return df
+    if df.empty:
+        return df
+
+    unique_scales = sorted(df["scale"].dropna().unique())
+    if not unique_scales:
+        return df
+
+    chosen = scale
+    if chosen is None:
+        if len(unique_scales) > 1:
+            chosen = int(max(unique_scales))
+            print(
+                f"  [INFO] {label}: wykryto wiele skal {unique_scales}; używam domyślnie największej: {chosen}"
+            )
+        else:
+            chosen = int(unique_scales[0])
+
+    filtered = df[df["scale"] == chosen].copy()
+    if filtered.empty:
+        print(
+            f"  [WARN] {label}: brak danych dla scale={chosen}; dostępne: {unique_scales}. Używam danych bez filtrowania."
+        )
+        return df
+    return filtered
+
+
+def savefig(fig: Figure, out_dir: Path, name: str, dpi: int) -> None:
     out_path = out_dir / name
     fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
     print(f"  -> zapisano: {out_path}")
     plt.close(fig)
 
 
-def _rotate_labels(ax: plt.Axes, angle: int = 25) -> None:
+def _rotate_labels(ax: Axes, angle: int = 25) -> None:
     ax.set_xticklabels(ax.get_xticklabels(), rotation=angle, ha="right", fontsize=9)
 
 
@@ -81,7 +141,7 @@ def _rotate_labels(ax: plt.Axes, angle: int = 25) -> None:
 # PLOT 1 & 2: INSERT – avg time and ops/sec per scenario (3 runs averaged)
 # ---------------------------------------------------------------------------
 
-def plot_insert_time_per_scenario(df: pd.DataFrame, out_dir: Path, dpi: int) -> None:
+def plot_insert_time_per_scenario(df: DataFrame, out_dir: Path, dpi: int) -> None:
     agg = df.groupby(["scale", "scenario"])["seconds"].mean().reset_index()
     agg.rename(columns={"seconds": "avg_seconds"}, inplace=True)
 
@@ -118,7 +178,7 @@ def plot_insert_time_per_scenario(df: pd.DataFrame, out_dir: Path, dpi: int) -> 
     savefig(fig, out_dir, "insert_avg_time_per_scenario.png", dpi)
 
 
-def plot_insert_ops_per_sec(df: pd.DataFrame, out_dir: Path, dpi: int) -> None:
+def plot_insert_ops_per_sec(df: DataFrame, out_dir: Path, dpi: int) -> None:
     df2 = df[df["ops_per_sec"].notna()].copy()
     agg = df2.groupby(["scale", "scenario"])["ops_per_sec"].mean().reset_index()
 
@@ -151,11 +211,78 @@ def plot_insert_ops_per_sec(df: pd.DataFrame, out_dir: Path, dpi: int) -> None:
 
 
 # ---------------------------------------------------------------------------
+# PLOT X: DELETE – avg time per scenario grouped by scale (like INSERT)
+# ---------------------------------------------------------------------------
+
+def plot_delete_time_per_scenario(df: DataFrame, out_dir: Path, dpi: int) -> None:
+    if "scale" not in df.columns:
+        print("  [POMINIĘTO] DELETE avg time per scenario: brak kolumny 'scale' w CSV")
+        return
+
+    df2 = df.copy()
+    if "index_mode" in df2.columns:
+        if "with_indexes" in set(df2["index_mode"].unique()):
+            df2 = df2[df2["index_mode"] == "with_indexes"].copy()
+        else:
+            # If file has index_mode but not the expected value, just use what exists.
+            df2 = df2.copy()
+
+    agg = df2.groupby(["scale", "scenario"])["seconds"].mean().reset_index()
+    agg.rename(columns={"seconds": "avg_seconds"}, inplace=True)
+
+    scales = sorted(agg["scale"].unique())
+    scenarios = sorted(agg["scenario"].unique())
+    colors = dict(zip(scales, SCALE_PALETTE[: len(scales)]))
+
+    fig, ax = plt.subplots(figsize=(11, 5))
+    x = range(len(scenarios))
+    width = 0.25 if len(scales) <= 3 else max(0.12, 0.8 / len(scales))
+
+    for i, scale in enumerate(scales):
+        vals = [
+            agg[(agg["scale"] == scale) & (agg["scenario"] == s)]["avg_seconds"].values
+            for s in scenarios
+        ]
+        heights = [v[0] if len(v) > 0 else 0 for v in vals]
+        offset = (i - len(scales) / 2 + 0.5) * width
+        bars = ax.bar(
+            [xi + offset for xi in x],
+            heights,
+            width=width,
+            color=colors.get(scale, "#888888"),
+            label=f"scale={int(scale):,}",
+            alpha=0.85,
+            edgecolor="white",
+        )
+        for bar in bars:
+            h = bar.get_height()
+            if h > 0:
+                ax.text(
+                    bar.get_x() + bar.get_width() / 2,
+                    h * 1.02,
+                    f"{h:.4f}s",
+                    ha="center",
+                    va="bottom",
+                    fontsize=7,
+                )
+
+    ax.set_xticks(list(x))
+    ax.set_xticklabels(scenarios, rotation=20, ha="right", fontsize=9)
+    ax.set_ylabel("Średni czas [s]")
+    ax.set_title("DELETE – Średni czas wykonania per scenariusz (z indeksami)")
+    ax.legend(title="Skala danych")
+    ax.yaxis.set_minor_locator(mticker.AutoMinorLocator())
+    ax.grid(axis="y", alpha=0.4)
+    fig.tight_layout()
+    savefig(fig, out_dir, "delete_avg_time_per_scenario.png", dpi)
+
+
+# ---------------------------------------------------------------------------
 # PLOT 3: Before/after index comparison (READ / UPDATE / DELETE)
 # ---------------------------------------------------------------------------
 
 def plot_before_after_index(
-    df: pd.DataFrame,
+    df: DataFrame,
     crud_name: str,
     time_col: str,
     out_dir: Path,
@@ -205,7 +332,7 @@ def plot_before_after_index(
 # PLOT 4: Speedup ratio (with_indexes / no_indexes)
 # ---------------------------------------------------------------------------
 
-def plot_speedup(dfs: Dict[str, pd.DataFrame], time_col_map: Dict[str, str], out_dir: Path, dpi: int) -> None:
+def plot_speedup(dfs: Dict[str, DataFrame], time_col_map: Dict[str, str], out_dir: Path, dpi: int) -> None:
     """
     Horizontal bar chart showing speedup = time_no_idx / time_with_idx per scenario.
     Values > 1 mean index is faster; values < 1 mean slower (unusual).
@@ -254,10 +381,10 @@ def plot_speedup(dfs: Dict[str, pd.DataFrame], time_col_map: Dict[str, str], out
 # ---------------------------------------------------------------------------
 
 def plot_all_scenarios_overview(
-    insert_df: Optional[pd.DataFrame],
-    read_df: Optional[pd.DataFrame],
-    update_df: Optional[pd.DataFrame],
-    delete_df: Optional[pd.DataFrame],
+    insert_df: Optional[DataFrame],
+    read_df: Optional[DataFrame],
+    update_df: Optional[DataFrame],
+    delete_df: Optional[DataFrame],
     out_dir: Path,
     dpi: int,
 ) -> None:
@@ -306,7 +433,7 @@ def plot_all_scenarios_overview(
     ax.grid(axis="x", alpha=0.35)
 
     # legend for CRUD categories
-    from matplotlib.patches import Patch
+    from matplotlib.patches import Patch  # type: ignore
     legend_patches = [Patch(color=c, label=k) for k, c in CRUD_COLORS.items()]
     ax.legend(handles=legend_patches, loc="lower right")
 
@@ -318,7 +445,7 @@ def plot_all_scenarios_overview(
 # PLOT 6: Heatmap – seconds per scenario x run (quality check)
 # ---------------------------------------------------------------------------
 
-def plot_heatmap(df: pd.DataFrame, crud_name: str, time_col: str, out_dir: Path, dpi: int) -> None:
+def plot_heatmap(df: DataFrame, crud_name: str, time_col: str, out_dir: Path, dpi: int) -> None:
     """Heatmap of raw run times to visualise variance."""
     if "index_mode" in df.columns:
         df = df[df["index_mode"] == "with_indexes"].copy()
@@ -349,7 +476,18 @@ def main() -> int:
                         help="Katalog wyjściowy dla PNG (domyślnie: ./charts)")
     parser.add_argument("--dpi", type=int, default=150)
     parser.add_argument("--style", default="seaborn-v0_8-whitegrid")
+    parser.add_argument(
+        "--scale",
+        type=int,
+        default=None,
+        help=(
+            "Jeśli plik CSV zawiera kolumnę 'scale', filtruje dane do podanej skali. "
+            "Bez tej flagi, dla READ/UPDATE/DELETE używana jest największa dostępna skala."
+        ),
+    )
     args = parser.parse_args()
+
+    _require_plot_deps()
 
     results_dir = Path(args.results_dir)
     out_dir = Path(args.output_dir)
@@ -367,47 +505,64 @@ def main() -> int:
     update_df = load_csv(results_dir / "psql_update_benchmark_results.csv")
     delete_df = load_csv(results_dir / "psql_delete_benchmark_results.csv")
 
+    # Keep raw frames for multi-scale plots; create single-scale views for charts that
+    # assume one scale (READ/UPDATE/DELETE before-after, speedup, overview).
+    insert_df_multi = insert_df
+    delete_df_multi = delete_df
+
+    insert_df_single = insert_df
+    if insert_df is not None and args.scale is not None:
+        insert_df_single = _filter_scale(insert_df, args.scale, "INSERT")
+
+    read_df_single = _filter_scale(read_df, args.scale, "READ") if read_df is not None else None
+    update_df_single = _filter_scale(update_df, args.scale, "UPDATE") if update_df is not None else None
+    delete_df_single = _filter_scale(delete_df, args.scale, "DELETE") if delete_df is not None else None
+
     print(f"\n=== Generowanie wykresów -> {out_dir} ===\n")
 
     # INSERT charts
-    if insert_df is not None:
+    if insert_df_multi is not None:
         print("[1/8] INSERT – czas per scenariusz")
-        plot_insert_time_per_scenario(insert_df, out_dir, args.dpi)
+        plot_insert_time_per_scenario(insert_df_multi, out_dir, args.dpi)
 
         print("[2/8] INSERT – ops/sec per scenariusz")
-        plot_insert_ops_per_sec(insert_df, out_dir, args.dpi)
+        plot_insert_ops_per_sec(insert_df_multi, out_dir, args.dpi)
 
         print("[3/8] INSERT – heatmap prób")
-        plot_heatmap(insert_df, "INSERT", "seconds", out_dir, args.dpi)
+        plot_heatmap(insert_df_single, "INSERT", "seconds", out_dir, args.dpi)
 
     # READ charts
-    if read_df is not None:
+    if read_df_single is not None:
         print("[4/8] READ – przed/po indeksach")
-        plot_before_after_index(read_df, "READ", "seconds", out_dir, args.dpi)
+        plot_before_after_index(read_df_single, "READ", "seconds", out_dir, args.dpi)
 
         print("[4b]  READ – heatmap prób")
-        plot_heatmap(read_df, "READ", "seconds", out_dir, args.dpi)
+        plot_heatmap(read_df_single, "READ", "seconds", out_dir, args.dpi)
 
     # UPDATE charts
-    if update_df is not None:
+    if update_df_single is not None:
         print("[5/8] UPDATE – przed/po indeksach")
-        plot_before_after_index(update_df, "UPDATE", "seconds", out_dir, args.dpi)
+        plot_before_after_index(update_df_single, "UPDATE", "seconds", out_dir, args.dpi)
 
         print("[5b]  UPDATE – heatmap prób")
-        plot_heatmap(update_df, "UPDATE", "seconds", out_dir, args.dpi)
+        plot_heatmap(update_df_single, "UPDATE", "seconds", out_dir, args.dpi)
 
     # DELETE charts
-    if delete_df is not None:
-        print("[6/8] DELETE – przed/po indeksach")
-        plot_before_after_index(delete_df, "DELETE", "seconds", out_dir, args.dpi)
+    if delete_df_multi is not None:
+        print("[6/8] DELETE – czas per scenariusz (skale)")
+        plot_delete_time_per_scenario(delete_df_multi, out_dir, args.dpi)
+
+    if delete_df_single is not None:
+        print("[6a] DELETE – przed/po indeksach")
+        plot_before_after_index(delete_df_single, "DELETE", "seconds", out_dir, args.dpi)
 
         print("[6b]  DELETE – heatmap prób")
-        plot_heatmap(delete_df, "DELETE", "seconds", out_dir, args.dpi)
+        plot_heatmap(delete_df_single, "DELETE", "seconds", out_dir, args.dpi)
 
     # Speedup chart
     dfs_for_speedup = {}
     time_col_map = {}
-    for name, df in [("READ", read_df), ("UPDATE", update_df), ("DELETE", delete_df)]:
+    for name, df in [("READ", read_df_single), ("UPDATE", update_df_single), ("DELETE", delete_df_single)]:
         if df is not None:
             dfs_for_speedup[name] = df
             time_col_map[name] = "seconds"
@@ -418,7 +573,7 @@ def main() -> int:
 
     # All scenarios overview
     print("[8/8] Przegląd wszystkich 24 scenariuszy")
-    plot_all_scenarios_overview(insert_df, read_df, update_df, delete_df, out_dir, args.dpi)
+    plot_all_scenarios_overview(insert_df_single, read_df_single, update_df_single, delete_df_single, out_dir, args.dpi)
 
     print(f"\nWszystkie wykresy zapisane w: {out_dir.resolve()}")
     print("Gotowe do wklejenia w sprawozdaniu!")

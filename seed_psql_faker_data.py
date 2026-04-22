@@ -405,7 +405,7 @@ def seed_all(
     n_tracks: int,
     seed: Optional[int] = None,
     truncate: bool = False,
-    pool_size: int = 10000,
+    pool_size: int = 1000,
 ) -> None:
     fake = Faker()
     if seed is not None:

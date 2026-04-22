@@ -9,9 +9,9 @@ Scenariusze:
   5. concurrent_delete   – równoległe usuwanie tracków z wielu wątków
   6. soft_delete         – UPDATE albums SET updated_at=now() zamiast DELETE
 
-WAŻNE: Scenariusze 1–3 i 5 TWORZĄ dane tuż przed pomiarem a następnie je usuwają,
+WAŻNE: Scenariusze 1–3, 4 i 5 TWORZĄ dane tuż przed pomiarem a następnie je usuwają,
 żeby czas dotyczył TYLKO operacji DELETE (bez contamination setupu).
-Scenariusz 4 i 6 działają na istniejących danych.
+Scenariusz 6 działa na istniejących danych.
 
 Uruchomienie (z katalogu postgres/):
   python benchmark_psql_delete_scenarios.py --no-indexes
@@ -55,6 +55,82 @@ def connect_db(cfg: DbConfig) -> psycopg.Connection:
     )
     conn.execute("SET search_path TO spotify, public;")
     return conn
+
+
+def ensure_existing_schema(conn: psycopg.Connection) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT count(*)
+            FROM information_schema.tables
+            WHERE table_schema = 'spotify'
+              AND table_name IN ('artists', 'albums', 'tracks', 'track_artists', 'track_albums')
+            """
+        )
+        found = int(cur.fetchone()[0])
+        if found < 5:
+            raise RuntimeError(
+                "Required spotify schema/tables not found. Run init.postgres.sql first."
+            )
+    conn.commit()
+
+
+def _count_rows(conn: psycopg.Connection, table_name: str) -> int:
+    with conn.cursor() as cur:
+        cur.execute(f"SELECT count(*) FROM {table_name}")
+        return int(cur.fetchone()[0])
+
+
+def parse_scales(raw: str) -> list[int]:
+    scales: list[int] = []
+    for part in raw.split(","):
+        text = part.strip()
+        if not text:
+            continue
+        value = int(text)
+        if value <= 0:
+            raise ValueError("Scale must be positive")
+        scales.append(value)
+    if not scales:
+        raise ValueError("At least one scale is required")
+    return scales
+
+
+def prepare_scale_data_with_seed_script(
+    cfg: DbConfig,
+    target_rows: int,
+    seed_value: Optional[int],
+    pool_size: int,
+) -> None:
+    import sys
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parents[1]
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+
+    import seed_psql_faker_data as seed_script
+
+    seed_cfg = seed_script.DbConfig(
+        host=cfg.host,
+        port=cfg.port,
+        dbname=cfg.dbname,
+        user=cfg.user,
+        password=cfg.password,
+    )
+
+    # Build each scale from scratch for reproducible comparisons.
+    with seed_script.connect_db(seed_cfg) as seed_conn:
+        seed_script.seed_all(
+            seed_conn,
+            n_genres=30,
+            n_artists=max(50, target_rows // 20000),
+            n_albums=max(80, target_rows // 10000),
+            n_tracks=target_rows,
+            seed=seed_value,
+            truncate=True,
+            pool_size=pool_size,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +189,12 @@ def _new_spotify_id(prefix: str = "") -> str:
 
 def _new_isrc() -> str:
     return ("PL" + uuid.uuid4().hex.upper())[:12]
+
+
+def _scaled_count(scale: int, fraction: float, *, min_count: int, max_count: int) -> int:
+    if scale <= 0:
+        return min_count
+    return max(min_count, min(int(scale * fraction), max_count))
 
 
 # ---------------------------------------------------------------------------
@@ -231,53 +313,110 @@ def _setup_track_artist_relation(conn: psycopg.Connection, artist_id: int) -> tu
     return track_id, artist_id
 
 
-def _setup_old_chart_entries(conn: psycopg.Connection, chart_id: int, count: int = 1000) -> int:
-    """Insert `count` chart_entries with chart_date > 3 years ago."""
-    if chart_id is None:
-        return 0
-    old_date = date.today() - timedelta(days=365 * 4)  # 4 years ago
+def _setup_track_artist_relations_bulk(conn: psycopg.Connection, artist_id: int, count: int) -> str:
+    """Insert `count` temporary tracks + relations to one artist and return the spotify_track_id prefix tag."""
+    # We avoid returning IDs by tagging spotify_track_id with a unique prefix and using it in SQL.
+    tag = uuid.uuid4().hex[:5]
+    prefix = f"rb{tag}"  # 2 + 5 = 7 chars
 
-    # We need track_ids; reuse random existing ones
     with conn.cursor() as cur:
-        cur.execute("SELECT track_id FROM tracks ORDER BY random() LIMIT %s", (count,))
-        track_ids = [r[0] for r in cur.fetchall()]
+        with cur.copy(
+            "COPY tracks (spotify_track_id, name, explicit, duration_min, disc_number, track_number, isrc) FROM STDIN"
+        ) as copy:
+            for i in range(count):
+                spotify_track_id = f"{prefix}{i:015d}"  # 7 + 15 = 22
+                # 12 chars total
+                isrc = f"PL{tag.upper()}{i:05d}"[:12]
+                copy.write_row(
+                    (
+                        spotify_track_id,
+                        f"RelBulk_{tag}_{i}",
+                        False,
+                        2.5,
+                        1,
+                        1,
+                        isrc,
+                    )
+                )
 
-    if not track_ids:
-        return 0
+        # Link every inserted track to the chosen artist (setup is outside timed window)
+        cur.execute(
+            """
+            INSERT INTO track_artists (track_id, artist_id, artist_order)
+            SELECT t.track_id, %s, 1
+            FROM tracks t
+            WHERE t.spotify_track_id LIKE %s
+            """,
+            (artist_id, f"{prefix}%"),
+        )
 
-    inserted = 0
-    with conn.cursor() as cur:
-        for i, tid in enumerate(track_ids):
-            # vary the date slightly so UNIQUE constraint (chart_id, track_id, chart_date) holds
-            entry_date = old_date - timedelta(days=i % 30)
-            cur.execute(
-                """
-                INSERT INTO chart_entries (chart_id, track_id, chart_date, position, streams)
-                VALUES (%s, %s, %s, %s, %s)
-                ON CONFLICT DO NOTHING
-                """,
-                (chart_id, tid, entry_date, (i % 200) + 1, random.randint(100_000, 5_000_000)),
-            )
-            inserted += 1
     conn.commit()
-    return inserted
+    return prefix
+
+
+def _setup_old_chart_entries(conn: psycopg.Connection, chart_id: int, count: int) -> int:
+    """Insert `count` chart_entries with chart_date older than 3 years (fast, set-based)."""
+    if chart_id is None or count <= 0:
+        return 0
+
+    old_date = date.today() - timedelta(days=365 * 4)  # 4 years ago
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            WITH sel AS (
+              SELECT track_id, row_number() OVER () AS rn
+              FROM (SELECT track_id FROM tracks ORDER BY track_id LIMIT %s) t
+            )
+            INSERT INTO chart_entries (chart_id, track_id, chart_date, position, streams)
+            SELECT
+              %s,
+              sel.track_id,
+              (%s::date - (sel.rn %% 3650) * interval '1 day')::date,
+              ((sel.rn - 1) %% 200) + 1,
+              (100000 + (random() * 4900000)::int)
+            FROM sel
+            ON CONFLICT DO NOTHING
+            """,
+            (count, chart_id, old_date),
+        )
+        inserted = cur.rowcount or 0
+    conn.commit()
+    return int(inserted)
 
 
 def _setup_tracks_for_concurrent_delete(conn: psycopg.Connection, count: int) -> list[int]:
-    """Insert `count` temporary tracks and return their track_ids."""
-    track_ids = []
+    """Insert `count` temporary tracks (fast) and return their track_ids."""
+    if count <= 0:
+        return []
+
+    tag = uuid.uuid4().hex[:5]
+    prefix = f"cc{tag}"  # 7 chars
+
     with conn.cursor() as cur:
-        for _ in range(count):
-            cur.execute(
-                """
-                INSERT INTO tracks (spotify_track_id, name, explicit, duration_min,
-                                    disc_number, track_number, isrc)
-                VALUES (%s, %s, false, 3.0, 1, 1, %s)
-                RETURNING track_id
-                """,
-                (_new_spotify_id("conc"), f"ConcTrack_{uuid.uuid4().hex[:8]}", _new_isrc()),
-            )
-            track_ids.append(int(cur.fetchone()[0]))
+        with cur.copy(
+            "COPY tracks (spotify_track_id, name, explicit, duration_min, disc_number, track_number, isrc) FROM STDIN"
+        ) as copy:
+            for i in range(count):
+                spotify_track_id = f"{prefix}{i:015d}"  # 7 + 15 = 22
+                isrc = f"PL{tag.upper()}{i:05d}"[:12]
+                copy.write_row(
+                    (
+                        spotify_track_id,
+                        f"ConcBulk_{tag}_{i}",
+                        False,
+                        3.0,
+                        1,
+                        1,
+                        isrc,
+                    )
+                )
+
+        cur.execute(
+            "SELECT track_id FROM tracks WHERE spotify_track_id LIKE %s ORDER BY track_id",
+            (f"{prefix}%",),
+        )
+        track_ids = [int(r[0]) for r in cur.fetchall()]
+
     conn.commit()
     return track_ids
 
@@ -318,32 +457,47 @@ def scenario_cascade_delete(conn: psycopg.Connection, samples: dict) -> tuple[fl
     return elapsed, affected
 
 
-def scenario_relationship_delete(conn: psycopg.Connection, samples: dict) -> tuple[float, int]:
+def scenario_relationship_delete(conn: psycopg.Connection, samples: dict, scale: int) -> tuple[float, int]:
     """
-    S3 – Relationship Delete: usuń powiązanie track_artists (co-artist).
+    S3 – Relationship Delete (scaled): usuń powiązania track_artists dla paczki tracków.
+    Liczba relacji do skasowania skaluje się z `scale`.
     """
     artist_id = random.choice(samples["artist_ids"])
-    track_id, artist_id = _setup_track_artist_relation(conn, artist_id)
+    rel_count = _scaled_count(scale, 0.001, min_count=500, max_count=50000)
+    prefix = _setup_track_artist_relations_bulk(conn, artist_id, rel_count)
 
     start = time.perf_counter()
     with conn.transaction():
         with conn.cursor() as cur:
             cur.execute(
-                "DELETE FROM track_artists WHERE track_id = %s AND artist_id = %s",
-                (track_id, artist_id),
+                """
+                DELETE FROM track_artists ta
+                USING tracks t
+                WHERE ta.track_id = t.track_id
+                  AND ta.artist_id = %s
+                  AND t.spotify_track_id LIKE %s
+                """,
+                (artist_id, f"{prefix}%"),
             )
             affected = cur.rowcount
     elapsed = time.perf_counter() - start
+
+    # Cleanup outside timed window (leave base dataset intact)
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM tracks WHERE spotify_track_id LIKE %s", (f"{prefix}%",))
+
     return elapsed, affected
 
 
-def scenario_range_delete(conn: psycopg.Connection, samples: dict) -> tuple[float, int]:
+def scenario_range_delete(conn: psycopg.Connection, samples: dict, scale: int) -> tuple[float, int]:
     """
     S4 – Range Delete: usuń chart_entries starsze niż 3 lata.
-    Dane są wstępnie inserowane (~1000 wpisów); mierzymy DELETE.
+    Dane są wstępnie inserowane (ułamek `scale`); mierzymy DELETE.
     """
     chart_id = samples["chart_id"]
-    _setup_old_chart_entries(conn, chart_id, count=1000)
+    entries_count = _scaled_count(scale, 0.005, min_count=2000, max_count=200000)
+    _setup_old_chart_entries(conn, chart_id, count=entries_count)
 
     cutoff = date.today() - timedelta(days=365 * 3)
 
@@ -351,32 +505,63 @@ def scenario_range_delete(conn: psycopg.Connection, samples: dict) -> tuple[floa
     with conn.transaction():
         with conn.cursor() as cur:
             cur.execute(
-                "DELETE FROM chart_entries WHERE chart_date < %s",
-                (cutoff,),
+                "DELETE FROM chart_entries WHERE chart_id = %s AND chart_date < %s",
+                (chart_id, cutoff),
             )
             affected = cur.rowcount
     elapsed = time.perf_counter() - start
     return elapsed, affected
 
 
-def _concurrent_delete_worker(cfg: DbConfig, track_id: int) -> int:
+def _concurrent_delete_worker(cfg: DbConfig, chunks: list[list[int]]) -> int:
+    if not chunks:
+        return 0
+
+    # Important: reuse a single DB connection per worker.
+    # Creating thousands of short-lived connections on Windows can exhaust ephemeral ports
+    # and fail with WSAEADDRINUSE ("Address already in use").
     with connect_db(cfg) as worker_conn:
+        deleted = 0
+        # Use one transaction for the whole worker batch.
         with worker_conn.transaction():
             with worker_conn.cursor() as cur:
-                cur.execute("DELETE FROM tracks WHERE track_id = %s", (track_id,))
-                return cur.rowcount
+                for ids in chunks:
+                    if not ids:
+                        continue
+                    cur.execute("DELETE FROM tracks WHERE track_id = ANY(%s)", (ids,))
+                    deleted += int(cur.rowcount or 0)
+        return deleted
 
 
-def scenario_concurrent_delete(cfg: DbConfig, conn: psycopg.Connection, workers: int = 50) -> tuple[float, int]:
+def scenario_concurrent_delete(
+    cfg: DbConfig,
+    conn: psycopg.Connection,
+    scale: int,
+    workers: int = 50,
+    chunk_size: int = 500,
+) -> tuple[float, int]:
     """
     S5 – Concurrent Delete: równoległe usuwanie tracków z wielu wątków.
     Testuje mechanizmy rozwiązywania blokad (deadlocks, row-level locking).
+    Liczba usuwanych rekordów skaluje się z `scale`, a liczba wątków to `workers`.
     """
-    track_ids = _setup_tracks_for_concurrent_delete(conn, count=workers)
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be > 0")
+
+    delete_count = _scaled_count(scale, 0.0005, min_count=workers, max_count=50000)
+    track_ids = _setup_tracks_for_concurrent_delete(conn, count=delete_count)
+
+    # Fixed chunk size: number of DB roundtrips grows with scale.
+    chunks = [track_ids[i : i + chunk_size] for i in range(0, len(track_ids), chunk_size)]
+
+    # Assign chunks to workers (each worker keeps one connection and processes many chunks).
+    buckets: list[list[list[int]]] = [[] for _ in range(max(1, workers))]
+    for i, ch in enumerate(chunks):
+        buckets[i % len(buckets)].append(ch)
 
     start = time.perf_counter()
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        results = list(pool.map(lambda tid: _concurrent_delete_worker(cfg, tid), track_ids))
+        results = list(pool.map(lambda worker_chunks: _concurrent_delete_worker(cfg, worker_chunks), buckets))
     elapsed = time.perf_counter() - start
     return elapsed, sum(results)
 
@@ -406,68 +591,103 @@ def scenario_soft_delete(conn: psycopg.Connection, samples: dict) -> tuple[float
 
 def run_benchmark(
     cfg: DbConfig,
+    scales: Optional[list[int]],
     runs_per_scenario: int,
-    with_indexes: bool,
+    index_modes: list[bool],
     concurrent_workers: int,
+    concurrent_chunk_size: int,
+    skip_prepare: bool,
+    seed_value: Optional[int],
+    pool_size: int,
 ) -> list[dict]:
     results: list[dict] = []
 
-    with connect_db(cfg) as conn:
-        apply_indexes(conn, with_indexes)
-        samples = fetch_sample_ids(conn)
+    scales_to_run = scales if scales else [None]
 
-        index_label = "with_indexes" if with_indexes else "no_indexes"
+    if not index_modes:
+        raise ValueError("index_modes must not be empty")
 
-        # Scenarios return (elapsed, ops) tuples directly (setup is outside timed window)
-        scenario_defs = [
-            ("point_delete",        lambda: scenario_point_delete(conn, samples)),
-            ("cascade_delete",      lambda: scenario_cascade_delete(conn, samples)),
-            ("relationship_delete", lambda: scenario_relationship_delete(conn, samples)),
-            ("range_delete",        lambda: scenario_range_delete(conn, samples)),
-            ("concurrent_delete",   lambda: scenario_concurrent_delete(cfg, conn, concurrent_workers)),
-            ("soft_delete",         lambda: scenario_soft_delete(conn, samples)),
-        ]
+    for scale in scales_to_run:
+        if scale is not None and not skip_prepare:
+            print(f"\n[PREP] Seeding scale={scale:,} via seed_psql_faker_data.py ...")
+            prepare_scale_data_with_seed_script(
+                cfg=cfg,
+                target_rows=scale,
+                seed_value=seed_value,
+                pool_size=pool_size,
+            )
 
-        for scenario_name, scenario_fn in scenario_defs:
-            for run_idx in range(1, runs_per_scenario + 1):
-                elapsed, ops = scenario_fn()
-                results.append(
-                    {
-                        "index_mode": index_label,
-                        "scenario": scenario_name,
-                        "run": run_idx,
-                        "seconds": elapsed,
-                        "rows_affected": ops,
-                        "ops_per_sec": (ops / elapsed) if elapsed > 0 and ops > 0 else None,
-                    }
-                )
+        with connect_db(cfg) as conn:
+            ensure_existing_schema(conn)
+            effective_scale = scale if scale is not None else _count_rows(conn, "tracks")
+
+            # Fetch sample IDs once per scale; index toggling shouldn't change them.
+            samples = fetch_sample_ids(conn)
+
+            for with_indexes in index_modes:
+                index_label = "with_indexes" if with_indexes else "no_indexes"
+                apply_indexes(conn, with_indexes)
+
+                # Scenarios return (elapsed, ops) tuples directly (setup is outside timed window)
+                scenario_defs = [
+                    ("point_delete",        lambda: scenario_point_delete(conn, samples)),
+                    ("cascade_delete",      lambda: scenario_cascade_delete(conn, samples)),
+                    ("relationship_delete", lambda: scenario_relationship_delete(conn, samples, effective_scale)),
+                    ("range_delete",        lambda: scenario_range_delete(conn, samples, effective_scale)),
+                    (
+                        "concurrent_delete",
+                        lambda: scenario_concurrent_delete(
+                            cfg,
+                            conn,
+                            effective_scale,
+                            workers=concurrent_workers,
+                            chunk_size=concurrent_chunk_size,
+                        ),
+                    ),
+                    ("soft_delete",         lambda: scenario_soft_delete(conn, samples)),
+                ]
+
+                for scenario_name, scenario_fn in scenario_defs:
+                    for run_idx in range(1, runs_per_scenario + 1):
+                        elapsed, ops = scenario_fn()
+                        results.append(
+                            {
+                                "scale": effective_scale,
+                                "index_mode": index_label,
+                                "scenario": scenario_name,
+                                "run": run_idx,
+                                "seconds": elapsed,
+                                "rows_affected": ops,
+                                "ops_per_sec": (ops / elapsed) if elapsed > 0 and ops > 0 else None,
+                            }
+                        )
 
     return results
 
 
 def print_summary(results: list[dict]) -> None:
-    groups: dict[tuple[str, str], list[dict]] = {}
+    groups: dict[tuple[int, str, str], list[dict]] = {}
     for row in results:
-        key = (row["index_mode"], row["scenario"])
+        key = (int(row.get("scale", 0) or 0), row["index_mode"], row["scenario"])
         groups.setdefault(key, []).append(row)
 
     print("\n=== DELETE Benchmark Summary (avg z prób) ===")
-    print(f"{'index_mode':<15} {'scenario':<22} {'avg_sec':>10} {'avg_rows':>10} {'avg_ops/s':>12}")
-    print("-" * 72)
+    print(f"{'scale':>10} {'index_mode':<15} {'scenario':<22} {'avg_sec':>10} {'avg_rows':>10} {'avg_ops/s':>12}")
+    print("-" * 85)
 
-    for (index_mode, scenario), rows in sorted(groups.items()):
+    for (scale, index_mode, scenario), rows in sorted(groups.items()):
         avg_sec = mean(r["seconds"] for r in rows)
         avg_rows = mean(r["rows_affected"] for r in rows)
         valid_ops = [r["ops_per_sec"] for r in rows if r["ops_per_sec"] is not None]
         avg_ops = mean(valid_ops) if valid_ops else 0.0
-        print(f"{index_mode:<15} {scenario:<22} {avg_sec:>10.6f} {avg_rows:>10.1f} {avg_ops:>12.2f}")
+        print(f"{scale:>10} {index_mode:<15} {scenario:<22} {avg_sec:>10.6f} {avg_rows:>10.1f} {avg_ops:>12.2f}")
 
 
 def save_results_csv(results: list[dict], out_path: str) -> None:
     import csv
 
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    fieldnames = ["index_mode", "scenario", "run", "seconds", "rows_affected", "ops_per_sec"]
+    fieldnames = ["scale", "index_mode", "scenario", "run", "seconds", "rows_affected", "ops_per_sec"]
     with open(out_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -488,9 +708,36 @@ def main() -> int:
         action="store_true",
         help="Usuwa zarządzane indeksy przed testem (tryb 'bez indeksów').",
     )
+    parser.add_argument(
+        "--both-index-modes",
+        action="store_true",
+        help="Uruchamia benchmark w dwóch trybach (bez indeksów i z indeksami) i zapisuje do jednego CSV.",
+    )
+    parser.add_argument(
+        "--scales",
+        default=None,
+        help=(
+            "Lista skal (np. 500000,1000000,10000000). "
+            "Jeśli podane, skrypt automatycznie seeduje bazę dla każdej skali "
+            "używając seed_psql_faker_data.py (TRUNCATE + seed_all)."
+        ),
+    )
     parser.add_argument("--runs-per-scenario",   type=int, default=3)
     parser.add_argument("--concurrent-workers",  type=int, default=50)
-    parser.add_argument("--output", default="results/psql_delete_benchmark_results.csv")
+    parser.add_argument(
+        "--concurrent-chunk-size",
+        type=int,
+        default=500,
+        help="Ile track_id kasuje jeden worker w pojedynczym DELETE (stały chunk size).",
+    )
+    parser.add_argument("--seed-value", type=int, default=1)
+    parser.add_argument("--pool-size", type=int, default=10000)
+    parser.add_argument(
+        "--skip-prepare",
+        action="store_true",
+        help="Nie seeduje danych dla skal (zakłada, że baza jest już przygotowana).",
+    )
+    parser.add_argument("--output", default="postgres/results/psql_delete_benchmark_results.csv")
 
     parser.add_argument("--db-host",     default=os.getenv("DB_HOST",     "localhost"))
     parser.add_argument("--db-port",     type=int, default=int(os.getenv("DB_PORT", "5434")))
@@ -500,6 +747,17 @@ def main() -> int:
 
     args = parser.parse_args()
 
+    if args.runs_per_scenario <= 0:
+        raise ValueError("runs-per-scenario must be > 0")
+    if args.concurrent_workers <= 0:
+        raise ValueError("concurrent-workers must be > 0")
+    if args.concurrent_chunk_size <= 0:
+        raise ValueError("concurrent-chunk-size must be > 0")
+    if args.pool_size <= 0:
+        raise ValueError("pool-size must be > 0")
+
+    scales = parse_scales(args.scales) if args.scales else None
+
     cfg = DbConfig(
         host=args.db_host,
         port=args.db_port,
@@ -508,15 +766,29 @@ def main() -> int:
         password=args.db_password,
     )
 
-    with_indexes = not args.no_indexes
-    mode_label = "Z indeksami" if with_indexes else "BEZ indeksów"
+    if args.both_index_modes:
+        index_modes = [False, True]
+        mode_label = "BEZ indeksów + Z indeksami"
+    else:
+        with_indexes = not args.no_indexes
+        index_modes = [with_indexes]
+        mode_label = "Z indeksami" if with_indexes else "BEZ indeksów"
+
     print(f"\n>>> PostgreSQL DELETE Benchmark – tryb: {mode_label} <<<")
+
+    if scales and not args.skip_prepare:
+        print(f"Info: uruchamiam benchmark dla skal: {', '.join(f'{s:,}' for s in scales)}")
 
     results = run_benchmark(
         cfg=cfg,
+        scales=scales,
         runs_per_scenario=args.runs_per_scenario,
-        with_indexes=with_indexes,
+        index_modes=index_modes,
         concurrent_workers=args.concurrent_workers,
+        concurrent_chunk_size=args.concurrent_chunk_size,
+        skip_prepare=args.skip_prepare,
+        seed_value=args.seed_value,
+        pool_size=args.pool_size,
     )
 
     save_results_csv(results, args.output)
