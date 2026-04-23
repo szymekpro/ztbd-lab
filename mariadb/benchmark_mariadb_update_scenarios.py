@@ -29,18 +29,6 @@ MANAGED_INDEXES = [
         "new": False,
     },
     {
-        "name": "idx_artist_genres_genre_id",
-        "create": "CREATE INDEX IF NOT EXISTS idx_artist_genres_genre_id ON artist_genres(genre_id)",
-        "drop": "DROP INDEX IF EXISTS idx_artist_genres_genre_id ON artist_genres",
-        "new": True,
-    },
-    {
-        "name": "idx_track_artists_artist_id",
-        "create": "CREATE INDEX IF NOT EXISTS idx_track_artists_artist_id ON track_artists(artist_id)",
-        "drop": "DROP INDEX IF EXISTS idx_track_artists_artist_id ON track_artists",
-        "new": True,
-    },
-    {
         "name": "idx_tracks_explicit",
         "create": "CREATE INDEX IF NOT EXISTS idx_tracks_explicit ON tracks(explicit)",
         "drop": "DROP INDEX IF EXISTS idx_tracks_explicit ON tracks",

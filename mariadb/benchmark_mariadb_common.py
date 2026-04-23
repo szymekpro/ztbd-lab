@@ -126,6 +126,15 @@ def apply_indexes(conn, managed_indexes: list[dict], with_indexes: bool) -> None
             sql = idx["create"] if with_indexes else idx["drop"]
             label = "(nowy)" if idx.get("new") else "(schemat)"
             print(f"  {'CREATE' if with_indexes else 'DROP':6s}  {idx['name']} {label}")
-            cur.execute(sql)
-    conn.commit()
+            try:
+                cur.execute(sql)
+                conn.commit()
+            except Exception as exc:
+                conn.rollback()
+                err_no = int(exc.args[0]) if getattr(exc, "args", None) else None
+                # MariaDB/InnoDB may block DROP for indexes bound to FK constraints.
+                if not with_indexes and err_no in (1091, 1553):
+                    print(f"  SKIP    {idx['name']} (pomijam: {exc})")
+                    continue
+                raise
     print("[INDEX] Gotowe.\n")
