@@ -136,6 +136,7 @@ def prepare_scale_data_with_seed_script(
             seed=seed_value,
             truncate=True,
             pool_size=pool_size,
+            include_audio_features=False,
         )
 
 
@@ -500,7 +501,6 @@ def run_benchmark(
     concurrent_workers: int,
     concurrent_chunk_size: int,
     skip_prepare: bool,
-    prepare_mode: str,
     seed_value: Optional[int],
     pool_size: int,
     index_modes: list[bool],
@@ -622,15 +622,6 @@ def main() -> int:
         default=500,
         help="Ile rekordów wstawia jeden worker w pojedynczym INSERT (stały chunk size).",
     )
-    parser.add_argument(
-        "--prepare-mode",
-        choices=["seed-script", "fast"],
-        default="seed-script",
-        help=(
-            "seed-script: przygotowuje skale przez seed_psql_faker_data.py; "
-            "fast: szybkie dopelnienie tracks bez pelnego seedowania"
-        ),
-    )
     parser.add_argument("--seed-value", type=int, default=1)
     parser.add_argument("--pool-size", type=int, default=10000)
     parser.add_argument(
@@ -690,7 +681,6 @@ def main() -> int:
         concurrent_workers=args.concurrent_workers,
         concurrent_chunk_size=args.concurrent_chunk_size,
         skip_prepare=args.skip_prepare,
-        prepare_mode=args.prepare_mode,
         seed_value=args.seed_value,
         pool_size=args.pool_size,
         index_modes=index_modes,

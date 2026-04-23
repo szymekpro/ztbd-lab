@@ -441,28 +441,31 @@ def seed_audio_features(session, n_tracks: int, seed: Optional[int], tuning: Wri
     if n_tracks <= 0:
         return
 
-    rng = random.Random(seed)
-
     def rows() -> Iterable[Sequence[object]]:
         decimal_fn = _decimal
-        rand = rng.random
-        randint = rng.randint
-        choice = rng.choice
         for track_id in range(1, n_tracks + 1):
+            # Deterministic pseudo-random values derived from track_id.
+            # Much faster than calling Python RNG ~10+ times per row at large scales.
+            u01a = ((track_id * 1103515245 + 12345) % 1000) / 1000.0
+            u01b = ((track_id * 1103515245 + 67890) % 1000) / 1000.0
+            u01c = ((track_id * 1103515245 + 44444) % 1000) / 1000.0
+            u01d = ((track_id * 1103515245 + 55555) % 1000) / 1000.0
+            u01e = ((track_id * 1103515245 + 77777) % 1000) / 1000.0
+            u01f = ((track_id * 1103515245 + 88888) % 1000) / 1000.0
             yield (
                 track_id,
-                decimal_fn(rand(), 3),
-                decimal_fn(rand(), 3),
-                randint(0, 11),
-                randint(0, 1),
-                decimal_fn(-rand() * 35.0, 3),
-                decimal_fn(rand(), 3),
-                decimal_fn(rand(), 3),
-                decimal_fn(rand(), 5),
-                decimal_fn(rand(), 3),
-                decimal_fn(rand(), 3),
-                decimal_fn(60.0 + rand() * 120.0, 2),
-                choice([3, 4, 5]),
+                decimal_fn(u01a, 3),
+                decimal_fn(u01b, 3),
+                int((track_id * 1103515245 + 11111) % 12),
+                int((track_id * 1103515245 + 22222) % 2),
+                decimal_fn(-(((track_id * 1103515245 + 33333) % 35000) / 1000.0), 3),
+                decimal_fn(u01c, 3),
+                decimal_fn(u01d, 3),
+                decimal_fn(((track_id * 1103515245 + 66666) % 100000) / 100000.0, 5),
+                decimal_fn(u01e, 3),
+                decimal_fn(u01f, 3),
+                decimal_fn(60.0 + (((track_id * 1103515245 + 99999) % 12000) / 100.0), 2),
+                [3, 4, 5][(track_id * 1103515245 + 13579) % 3],
             )
 
     insert_many(

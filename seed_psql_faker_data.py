@@ -318,32 +318,63 @@ def seed_relations_fast(
 
 
 def seed_audio_features_fast(conn) -> None:
-    with conn.cursor() as cur:
-        cur.execute(
+    """Seed spotify.audio_features for tracks that don't have it yet.
+
+    This can be a bottleneck for large scales. After TRUNCATE + reseed, track_id
+    can be large (500k..10M). We keep this a *single* SQL statement, avoid
+    `COUNT(*)` scans, avoid `ORDER BY random()`, and avoid per-row `random()` calls.
+    Values are synthetic, deterministic, and derived from track_id.
+    """
+
+    # Bulk insert: reduce commit latency (acceptable for synthetic seeding).
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.execute("SET LOCAL synchronous_commit TO off")
+            cur.execute("SET LOCAL jit TO off")
+
+            cur.execute("SELECT 1 FROM tracks LIMIT 1")
+            if cur.fetchone() is None:
+                return
+
+            cur.execute("SELECT 1 FROM audio_features LIMIT 1")
+            audio_features_empty = cur.fetchone() is None
+
+            # Deterministic pseudo-random values derived from track_id.
+            # This is dramatically faster than calling random() 10+ times per row.
+            sql_body = """
+                INSERT INTO audio_features (
+                    track_id, danceability, energy, key, mode, loudness, speechiness,
+                    acousticness, instrumentalness, liveness, valence, tempo, time_signature
+                )
+                SELECT t.track_id,
+                       round((( (t.track_id::bigint * 1103515245 + 12345)  % 1000 )::numeric) / 1000, 3),
+                       round((( (t.track_id::bigint * 1103515245 + 67890)  % 1000 )::numeric) / 1000, 3),
+                       ((t.track_id::bigint * 1103515245 + 11111) % 12)::smallint,
+                       ((t.track_id::bigint * 1103515245 + 22222) % 2)::smallint,
+                       -round((( (t.track_id::bigint * 1103515245 + 33333) % 35000 )::numeric) / 1000, 3),
+                       round((( (t.track_id::bigint * 1103515245 + 44444)  % 1000 )::numeric) / 1000, 3),
+                       round((( (t.track_id::bigint * 1103515245 + 55555)  % 1000 )::numeric) / 1000, 3),
+                       round((( (t.track_id::bigint * 1103515245 + 66666)  % 100000 )::numeric) / 100000, 5),
+                       round((( (t.track_id::bigint * 1103515245 + 77777)  % 1000 )::numeric) / 1000, 3),
+                       round((( (t.track_id::bigint * 1103515245 + 88888)  % 1000 )::numeric) / 1000, 3),
+                       round((60.0 + (((t.track_id::bigint * 1103515245 + 99999) % 12000)::numeric) / 100), 2),
+                       (ARRAY[3,4,5])[1 + (((t.track_id::bigint * 1103515245 + 13579) % 3)::int)]::smallint
+                FROM tracks t
             """
-            INSERT INTO audio_features (
-              track_id, danceability, energy, key, mode, loudness, speechiness,
-              acousticness, instrumentalness, liveness, valence, tempo, time_signature
-            )
-            SELECT t.track_id,
-                   round(random()::numeric, 3),
-                   round(random()::numeric, 3),
-                   floor(random() * 12)::smallint,
-                   floor(random() * 2)::smallint,
-                   round((random() * 35.0 * -1)::numeric, 3),
-                   round(random()::numeric, 3),
-                   round(random()::numeric, 3),
-                   round(random()::numeric, 5),
-                   round(random()::numeric, 3),
-                   round(random()::numeric, 3),
-                   round((60.0 + random() * 120.0)::numeric, 2),
-                   (ARRAY[3,4,5])[1 + floor(random()*3)]::smallint
-            FROM tracks t
-            LEFT JOIN audio_features af ON af.track_id = t.track_id
-            WHERE af.track_id IS NULL
-            """
-        )
-    conn.commit()
+
+            if audio_features_empty:
+                cur.execute(sql_body)
+            else:
+                cur.execute(
+                    sql_body
+                    + """
+                    WHERE NOT EXISTS (
+                        SELECT 1
+                        FROM audio_features af
+                        WHERE af.track_id = t.track_id
+                    )
+                    """
+                )
 
 
 def seed_charts(conn, market_ids: list[int]) -> list[int]:

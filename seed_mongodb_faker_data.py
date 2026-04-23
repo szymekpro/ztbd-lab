@@ -22,6 +22,13 @@ class DbConfig:
 _BASE62 = string.digits + string.ascii_letters
 _BASE36 = string.digits + string.ascii_uppercase
 
+_BATCH_SIZE = 50_000
+
+
+def _u01(track_id: int, salt: int, mod: int = 1000) -> float:
+    # Deterministic pseudo-random in [0, 1).
+    return ((track_id * 1103515245 + salt) % mod) / float(mod)
+
 
 def base_n_encode(value: int, alphabet: str) -> str:
     if value < 0:
@@ -239,7 +246,7 @@ def seed_tracks(db, fake: Faker, n: int, pool_size: int, seed: Optional[int]) ->
         for _ in range(max(500, min(pool_size, 20000)))
     ]
 
-    docs = []
+    docs: list[dict] = []
     track_ids: list[int] = []
     now = datetime.now(tz=timezone.utc)
     for i in range(1, n + 1):
@@ -258,11 +265,22 @@ def seed_tracks(db, fake: Faker, n: int, pool_size: int, seed: Optional[int]) ->
                 "created_at": now,
             }
         )
-        track_ids.append(i)
+
+        # Avoid holding huge lists in memory for large scales.
+        if len(docs) >= _BATCH_SIZE:
+            db.tracks.insert_many(docs, ordered=False)
+            docs.clear()
+
+        # Only keep explicit ids for small-ish scales (used for charts sampling etc.).
+        if n <= 1_000_000:
+            track_ids.append(i)
 
     if docs:
         db.tracks.insert_many(docs, ordered=False)
-    return track_ids
+
+    if n <= 1_000_000:
+        return track_ids
+    return list(range(1, min(n, 5000) + 1))
 
 
 def seed_relations(
@@ -275,16 +293,20 @@ def seed_relations(
     artists_per_album: int = 1,
     artists_per_track: int = 2,
 ) -> None:
-    artist_genres_docs = []
-    album_artists_docs = []
-    track_artists_docs = []
-    track_albums_docs = []
+    artist_genres_docs: list[dict] = []
+    album_artists_docs: list[dict] = []
+    track_artists_docs: list[dict] = []
+    track_albums_docs: list[dict] = []
 
     if artist_ids and genre_ids:
         for artist_id in artist_ids:
             for gs in range(1, max(1, genres_per_artist) + 1):
                 genre_idx = (artist_id - 1 + gs - 1) % len(genre_ids)
                 artist_genres_docs.append({"artist_id": artist_id, "genre_id": genre_ids[genre_idx]})
+
+                if len(artist_genres_docs) >= _BATCH_SIZE:
+                    db.artist_genres.insert_many(artist_genres_docs, ordered=False)
+                    artist_genres_docs.clear()
 
     if album_ids and artist_ids:
         for album_id in album_ids:
@@ -298,6 +320,10 @@ def seed_relations(
                     }
                 )
 
+                if len(album_artists_docs) >= _BATCH_SIZE:
+                    db.album_artists.insert_many(album_artists_docs, ordered=False)
+                    album_artists_docs.clear()
+
     if track_ids and artist_ids:
         for track_id in track_ids:
             for gs in range(1, max(1, artists_per_track) + 1):
@@ -310,6 +336,10 @@ def seed_relations(
                     }
                 )
 
+                if len(track_artists_docs) >= _BATCH_SIZE:
+                    db.track_artists.insert_many(track_artists_docs, ordered=False)
+                    track_artists_docs.clear()
+
     if track_ids and album_ids:
         for track_id in track_ids:
             album_idx = (track_id - 1) % len(album_ids)
@@ -320,6 +350,10 @@ def seed_relations(
                     "is_primary": True,
                 }
             )
+
+            if len(track_albums_docs) >= _BATCH_SIZE:
+                db.track_albums.insert_many(track_albums_docs, ordered=False)
+                track_albums_docs.clear()
 
     if artist_genres_docs:
         db.artist_genres.insert_many(artist_genres_docs, ordered=False)
@@ -332,26 +366,29 @@ def seed_relations(
 
 
 def seed_audio_features(db, track_ids: list[int], seed: Optional[int]) -> None:
-    rng = random.Random(seed)
-    docs = []
+    docs: list[dict] = []
     for track_id in track_ids:
         docs.append(
             {
                 "track_id": track_id,
-                "danceability": round(rng.random(), 3),
-                "energy": round(rng.random(), 3),
-                "key": rng.randint(0, 11),
-                "mode": rng.randint(0, 1),
-                "loudness": round(-rng.random() * 35.0, 3),
-                "speechiness": round(rng.random(), 3),
-                "acousticness": round(rng.random(), 3),
-                "instrumentalness": round(rng.random(), 5),
-                "liveness": round(rng.random(), 3),
-                "valence": round(rng.random(), 3),
-                "tempo": round(60.0 + rng.random() * 120.0, 2),
-                "time_signature": rng.choice([3, 4, 5]),
+                "danceability": round(_u01(track_id, 12345), 3),
+                "energy": round(_u01(track_id, 67890), 3),
+                "key": int((track_id * 1103515245 + 11111) % 12),
+                "mode": int((track_id * 1103515245 + 22222) % 2),
+                "loudness": -round(((track_id * 1103515245 + 33333) % 35000) / 1000.0, 3),
+                "speechiness": round(_u01(track_id, 44444), 3),
+                "acousticness": round(_u01(track_id, 55555), 3),
+                "instrumentalness": round(((track_id * 1103515245 + 66666) % 100000) / 100000.0, 5),
+                "liveness": round(_u01(track_id, 77777), 3),
+                "valence": round(_u01(track_id, 88888), 3),
+                "tempo": round(60.0 + (((track_id * 1103515245 + 99999) % 12000) / 100.0), 2),
+                "time_signature": [3, 4, 5][(track_id * 1103515245 + 13579) % 3],
             }
         )
+
+        if len(docs) >= _BATCH_SIZE:
+            db.audio_features.insert_many(docs, ordered=False)
+            docs.clear()
 
     if docs:
         db.audio_features.insert_many(docs, ordered=False)

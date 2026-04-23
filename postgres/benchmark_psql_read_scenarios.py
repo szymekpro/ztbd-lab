@@ -187,7 +187,7 @@ def prepare_scale_data_with_seed_script(
             seed=seed_value,
             truncate=True,
             pool_size=pool_size,
-            include_audio_features=False,
+            include_audio_features=True,
         )
 
 
@@ -199,74 +199,83 @@ def fetch_sample_ids(conn: psycopg.Connection) -> dict:
     """Fetch random existing IDs needed by the read scenarios."""
     samples: dict = {}
     with conn.cursor() as cur:
-        # random track with audio_features
+        # Avoid ORDER BY random() on big tables; sample via max-id based seeks.
+        cur.execute("SELECT COALESCE(MAX(track_id), 1) FROM audio_features")
+        max_af_track_id = int(cur.fetchone()[0] or 1)
+        start_track_id = random.randint(1, max_af_track_id)
         cur.execute(
             """
-            SELECT af.track_id
-            FROM audio_features af
-            ORDER BY random()
+            SELECT track_id
+            FROM audio_features
+            WHERE track_id >= %s
+            ORDER BY track_id
             LIMIT 20
-            """
+            """,
+            (start_track_id,),
         )
         rows = cur.fetchall()
-        samples["track_ids"] = [r[0] for r in rows] if rows else [1]
+        if not rows:
+            cur.execute("SELECT track_id FROM audio_features ORDER BY track_id LIMIT 20")
+            rows = cur.fetchall()
+        samples["track_ids"] = [int(r[0]) for r in rows] if rows else [1]
 
-        # random album that has tracks
+        cur.execute("SELECT COALESCE(MAX(album_id), 1) FROM albums")
+        max_album_id = int(cur.fetchone()[0] or 1)
+        start_album_id = random.randint(1, max_album_id)
         cur.execute(
             """
-            SELECT ta.album_id, COUNT(*) as cnt
-            FROM track_albums ta
-            GROUP BY ta.album_id
-            HAVING COUNT(*) > 0
-            ORDER BY random()
+            SELECT album_id
+            FROM albums
+            WHERE album_id >= %s
+            ORDER BY album_id
             LIMIT 10
-            """
+            """,
+            (start_album_id,),
         )
         rows = cur.fetchall()
-        samples["album_ids"] = [r[0] for r in rows] if rows else [1]
+        if not rows:
+            cur.execute("SELECT album_id FROM albums ORDER BY album_id LIMIT 10")
+            rows = cur.fetchall()
+        samples["album_ids"] = [int(r[0]) for r in rows] if rows else [1]
 
-        # random chart + date combo with at least 50 entries
+        cur.execute("SELECT COALESCE(MAX(chart_entry_id), 1) FROM chart_entries")
+        max_chart_entry_id = int(cur.fetchone()[0] or 1)
+        start_chart_entry_id = random.randint(1, max_chart_entry_id)
         cur.execute(
             """
             SELECT chart_id, chart_date
             FROM chart_entries
-            GROUP BY chart_id, chart_date
-            HAVING COUNT(*) >= 50
-            ORDER BY random()
-            LIMIT 10
-            """
+            WHERE chart_entry_id >= %s
+            ORDER BY chart_entry_id
+            LIMIT 50
+            """,
+            (start_chart_entry_id,),
         )
         rows = cur.fetchall()
-        samples["chart_date_pairs"] = [(r[0], r[1]) for r in rows] if rows else [(1, "2024-01-01")]
+        if not rows:
+            cur.execute(
+                "SELECT chart_id, chart_date FROM chart_entries ORDER BY chart_entry_id LIMIT 50"
+            )
+            rows = cur.fetchall()
+        seen_pairs: set[tuple[int, object]] = set()
+        chart_date_pairs: list[tuple[int, object]] = []
+        for chart_id, chart_date in rows:
+            key = (int(chart_id), chart_date)
+            if key in seen_pairs:
+                continue
+            seen_pairs.add(key)
+            chart_date_pairs.append(key)
+            if len(chart_date_pairs) >= 10:
+                break
+        samples["chart_date_pairs"] = chart_date_pairs if chart_date_pairs else [(1, "2024-01-01")]
 
-        # random chart ids (for scaled chart reads across many dates)
-        cur.execute(
-            """
-            SELECT chart_id, COUNT(*) AS cnt
-            FROM chart_entries
-            GROUP BY chart_id
-            HAVING COUNT(*) >= 500
-            ORDER BY random()
-            LIMIT 10
-            """
-        )
+        cur.execute("SELECT chart_id FROM charts ORDER BY chart_id LIMIT 10")
         rows = cur.fetchall()
-        samples["chart_ids"] = [r[0] for r in rows] if rows else [1]
+        samples["chart_ids"] = [int(r[0]) for r in rows] if rows else [1]
 
-        # random artist with audio_features data
-        cur.execute(
-            """
-            SELECT ta.artist_id
-            FROM track_artists ta
-            JOIN audio_features af ON af.track_id = ta.track_id
-            GROUP BY ta.artist_id
-            HAVING COUNT(*) >= 5
-            ORDER BY random()
-            LIMIT 10
-            """
-        )
+        cur.execute("SELECT artist_id FROM artists ORDER BY artist_id LIMIT 10")
         rows = cur.fetchall()
-        samples["artist_ids"] = [r[0] for r in rows] if rows else [1]
+        samples["artist_ids"] = [int(r[0]) for r in rows] if rows else [1]
 
     conn.commit()
     print(f"[SETUP] Załadowano sample IDs:")

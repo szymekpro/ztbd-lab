@@ -439,19 +439,21 @@ def seed_audio_features_fast(conn) -> None:
               acousticness, instrumentalness, liveness, valence, tempo, time_signature
             )
             SELECT t.track_id,
-                   ROUND(RAND(), 3),
-                   ROUND(RAND(), 3),
-                   FLOOR(RAND() * 12),
-                   FLOOR(RAND() * 2),
-                   ROUND(-RAND() * 35.0, 3),
-                   ROUND(RAND(), 3),
-                   ROUND(RAND(), 3),
-                   ROUND(RAND(), 5),
-                   ROUND(RAND(), 3),
-                   ROUND(RAND(), 3),
-                   ROUND(60.0 + RAND() * 120.0, 2),
-                   ELT(1 + FLOOR(RAND() * 3), 3, 4, 5)
+                   ROUND(MOD(t.track_id * 1103515245 + 12345, 1000) / 1000.0, 3),
+                   ROUND(MOD(t.track_id * 1103515245 + 67890, 1000) / 1000.0, 3),
+                   MOD(t.track_id * 1103515245 + 11111, 12),
+                   MOD(t.track_id * 1103515245 + 22222, 2),
+                   -ROUND(MOD(t.track_id * 1103515245 + 33333, 35000) / 1000.0, 3),
+                   ROUND(MOD(t.track_id * 1103515245 + 44444, 1000) / 1000.0, 3),
+                   ROUND(MOD(t.track_id * 1103515245 + 55555, 1000) / 1000.0, 3),
+                   ROUND(MOD(t.track_id * 1103515245 + 66666, 100000) / 100000.0, 5),
+                   ROUND(MOD(t.track_id * 1103515245 + 77777, 1000) / 1000.0, 3),
+                   ROUND(MOD(t.track_id * 1103515245 + 88888, 1000) / 1000.0, 3),
+                   ROUND(60.0 + MOD(t.track_id * 1103515245 + 99999, 12000) / 100.0, 2),
+                   ELT(1 + MOD(t.track_id * 1103515245 + 13579, 3), 3, 4, 5)
             FROM tracks t
+            LEFT JOIN audio_features af ON af.track_id = t.track_id
+            WHERE af.track_id IS NULL
             """
         )
     conn.commit()

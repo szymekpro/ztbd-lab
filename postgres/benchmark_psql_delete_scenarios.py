@@ -598,6 +598,7 @@ def run_benchmark(
     concurrent_workers: int,
     concurrent_chunk_size: int,
     skip_prepare: bool,
+    reseed_per_index_mode: bool,
     seed_value: Optional[int],
     pool_size: int,
 ) -> list[dict]:
@@ -609,7 +610,7 @@ def run_benchmark(
         raise ValueError("index_modes must not be empty")
 
     for scale in scales_to_run:
-        if scale is not None and not skip_prepare:
+        if scale is not None and not skip_prepare and not reseed_per_index_mode:
             print(f"\n[PREP] Seeding scale={scale:,} via seed_psql_faker_data.py ...")
             prepare_scale_data_with_seed_script(
                 cfg=cfg,
@@ -618,50 +619,104 @@ def run_benchmark(
                 pool_size=pool_size,
             )
 
-        with connect_db(cfg) as conn:
-            ensure_existing_schema(conn)
-            effective_scale = scale if scale is not None else _count_rows(conn, "tracks")
-
-            # Fetch sample IDs once per scale; index toggling shouldn't change them.
-            samples = fetch_sample_ids(conn)
-
+        if reseed_per_index_mode and scale is not None:
+            # For fairer comparisons: deletes can create bloat/dead tuples; reseed per mode isolates runs.
             for with_indexes in index_modes:
-                index_label = "with_indexes" if with_indexes else "no_indexes"
-                apply_indexes(conn, with_indexes)
+                if not skip_prepare:
+                    print(
+                        f"\n[PREP] (per index mode) Seeding scale={scale:,} via seed_psql_faker_data.py ..."
+                    )
+                    prepare_scale_data_with_seed_script(
+                        cfg=cfg,
+                        target_rows=scale,
+                        seed_value=seed_value,
+                        pool_size=pool_size,
+                    )
 
-                # Scenarios return (elapsed, ops) tuples directly (setup is outside timed window)
-                scenario_defs = [
-                    ("point_delete",        lambda: scenario_point_delete(conn, samples)),
-                    ("cascade_delete",      lambda: scenario_cascade_delete(conn, samples)),
-                    ("relationship_delete", lambda: scenario_relationship_delete(conn, samples, effective_scale)),
-                    ("range_delete",        lambda: scenario_range_delete(conn, samples, effective_scale)),
-                    (
-                        "concurrent_delete",
-                        lambda: scenario_concurrent_delete(
-                            cfg,
-                            conn,
-                            effective_scale,
-                            workers=concurrent_workers,
-                            chunk_size=concurrent_chunk_size,
+                with connect_db(cfg) as conn:
+                    ensure_existing_schema(conn)
+                    effective_scale = scale
+                    samples = fetch_sample_ids(conn)
+
+                    index_label = "with_indexes" if with_indexes else "no_indexes"
+                    apply_indexes(conn, with_indexes)
+
+                    scenario_defs = [
+                        ("point_delete",        lambda: scenario_point_delete(conn, samples)),
+                        ("cascade_delete",      lambda: scenario_cascade_delete(conn, samples)),
+                        ("relationship_delete", lambda: scenario_relationship_delete(conn, samples, effective_scale)),
+                        ("range_delete",        lambda: scenario_range_delete(conn, samples, effective_scale)),
+                        (
+                            "concurrent_delete",
+                            lambda: scenario_concurrent_delete(
+                                cfg,
+                                conn,
+                                effective_scale,
+                                workers=concurrent_workers,
+                                chunk_size=concurrent_chunk_size,
+                            ),
                         ),
-                    ),
-                    ("soft_delete",         lambda: scenario_soft_delete(conn, samples)),
-                ]
+                        ("soft_delete",         lambda: scenario_soft_delete(conn, samples)),
+                    ]
 
-                for scenario_name, scenario_fn in scenario_defs:
-                    for run_idx in range(1, runs_per_scenario + 1):
-                        elapsed, ops = scenario_fn()
-                        results.append(
-                            {
-                                "scale": effective_scale,
-                                "index_mode": index_label,
-                                "scenario": scenario_name,
-                                "run": run_idx,
-                                "seconds": elapsed,
-                                "rows_affected": ops,
-                                "ops_per_sec": (ops / elapsed) if elapsed > 0 and ops > 0 else None,
-                            }
-                        )
+                    for scenario_name, scenario_fn in scenario_defs:
+                        for run_idx in range(1, runs_per_scenario + 1):
+                            elapsed, ops = scenario_fn()
+                            results.append(
+                                {
+                                    "scale": effective_scale,
+                                    "index_mode": index_label,
+                                    "scenario": scenario_name,
+                                    "run": run_idx,
+                                    "seconds": elapsed,
+                                    "rows_affected": ops,
+                                    "ops_per_sec": (ops / elapsed) if elapsed > 0 and ops > 0 else None,
+                                }
+                            )
+        else:
+            with connect_db(cfg) as conn:
+                ensure_existing_schema(conn)
+                effective_scale = scale if scale is not None else _count_rows(conn, "tracks")
+
+                # Fetch sample IDs once per scale; index toggling shouldn't change them.
+                samples = fetch_sample_ids(conn)
+
+                for with_indexes in index_modes:
+                    index_label = "with_indexes" if with_indexes else "no_indexes"
+                    apply_indexes(conn, with_indexes)
+
+                    scenario_defs = [
+                        ("point_delete",        lambda: scenario_point_delete(conn, samples)),
+                        ("cascade_delete",      lambda: scenario_cascade_delete(conn, samples)),
+                        ("relationship_delete", lambda: scenario_relationship_delete(conn, samples, effective_scale)),
+                        ("range_delete",        lambda: scenario_range_delete(conn, samples, effective_scale)),
+                        (
+                            "concurrent_delete",
+                            lambda: scenario_concurrent_delete(
+                                cfg,
+                                conn,
+                                effective_scale,
+                                workers=concurrent_workers,
+                                chunk_size=concurrent_chunk_size,
+                            ),
+                        ),
+                        ("soft_delete",         lambda: scenario_soft_delete(conn, samples)),
+                    ]
+
+                    for scenario_name, scenario_fn in scenario_defs:
+                        for run_idx in range(1, runs_per_scenario + 1):
+                            elapsed, ops = scenario_fn()
+                            results.append(
+                                {
+                                    "scale": effective_scale,
+                                    "index_mode": index_label,
+                                    "scenario": scenario_name,
+                                    "run": run_idx,
+                                    "seconds": elapsed,
+                                    "rows_affected": ops,
+                                    "ops_per_sec": (ops / elapsed) if elapsed > 0 and ops > 0 else None,
+                                }
+                            )
 
     return results
 
@@ -738,6 +793,14 @@ def main() -> int:
         action="store_true",
         help="Nie seeduje danych dla skal (zakłada, że baza jest już przygotowana).",
     )
+    parser.add_argument(
+        "--reseed-per-index-mode",
+        action="store_true",
+        help=(
+            "Jeśli używasz --both-index-modes: reseeduj (TRUNCATE+seed) bazę przed każdym trybem indeksów. "
+            "Wolniejsze, ale bardziej uczciwe porównanie (brak wpływu bloatu/mutacji z pierwszego trybu na drugi)."
+        ),
+    )
     parser.add_argument("--output", default="postgres/results/psql_delete_benchmark_results.csv")
 
     parser.add_argument("--db-host",     default=os.getenv("DB_HOST",     "localhost"))
@@ -788,6 +851,7 @@ def main() -> int:
         concurrent_workers=args.concurrent_workers,
         concurrent_chunk_size=args.concurrent_chunk_size,
         skip_prepare=args.skip_prepare,
+        reseed_per_index_mode=args.reseed_per_index_mode,
         seed_value=args.seed_value,
         pool_size=args.pool_size,
     )

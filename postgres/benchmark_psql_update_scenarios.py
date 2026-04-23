@@ -172,7 +172,7 @@ def prepare_scale_data_with_seed_script(
             seed=seed_value,
             truncate=True,
             pool_size=pool_size,
-            include_audio_features=False,
+            include_audio_features=True,
         )
 
 
@@ -184,60 +184,97 @@ def fetch_sample_ids(conn: psycopg.Connection) -> dict:
     """Fetch random existing IDs needed by update scenarios."""
     samples: dict = {}
     with conn.cursor() as cur:
-        # tracks with audio_features
+        # tracks with audio_features (avoid ORDER BY random() on huge tables)
+        cur.execute("SELECT COALESCE(MAX(track_id), 1) FROM audio_features")
+        max_af_track_id = int(cur.fetchone()[0] or 1)
+        start_track_id = random.randint(1, max_af_track_id)
         cur.execute(
             """
-            SELECT af.track_id
-            FROM audio_features af
-            ORDER BY random()
+            SELECT track_id
+            FROM audio_features
+            WHERE track_id >= %s
+            ORDER BY track_id
             LIMIT 50
-            """
+            """,
+            (start_track_id,),
         )
         rows = cur.fetchall()
-        samples["track_ids"] = [r[0] for r in rows] if rows else [1]
+        if not rows:
+            cur.execute("SELECT track_id FROM audio_features ORDER BY track_id LIMIT 50")
+            rows = cur.fetchall()
+        samples["track_ids"] = [int(r[0]) for r in rows] if rows else [1]
 
         # max track id (for fast random sampling without ORDER BY random())
         cur.execute("SELECT COALESCE(MAX(track_id), 1) FROM tracks")
         samples["max_track_id"] = int(cur.fetchone()[0] or 1)
 
-        # chart_entries to atomically increment
+        # chart_entries to atomically increment (avoid ORDER BY random())
+        cur.execute("SELECT COALESCE(MAX(chart_entry_id), 1) FROM chart_entries")
+        max_chart_entry_id = int(cur.fetchone()[0] or 1)
+        start_chart_entry_id = random.randint(1, max_chart_entry_id)
         cur.execute(
             """
             SELECT chart_entry_id, position, streams
             FROM chart_entries
             WHERE streams IS NOT NULL
-            ORDER BY random()
+              AND chart_entry_id >= %s
+            ORDER BY chart_entry_id
             LIMIT 50
-            """
+            """,
+            (start_chart_entry_id,),
         )
         rows = cur.fetchall()
-        samples["chart_entries"] = [(r[0], r[1], r[2]) for r in rows] if rows else [(1, 5, 1000)]
+        if not rows:
+            cur.execute(
+                """
+                SELECT chart_entry_id, position, streams
+                FROM chart_entries
+                WHERE streams IS NOT NULL
+                ORDER BY chart_entry_id
+                LIMIT 50
+                """
+            )
+            rows = cur.fetchall()
+        samples["chart_entries"] = [(int(r[0]), int(r[1]), int(r[2] or 0)) for r in rows] if rows else [(1, 5, 1000)]
 
-        # track_ids with many chart entries (to make scaled atomic increments meaningful)
+        # track_ids present in chart_entries (fast sampling; seeded charts guarantee repeats)
         cur.execute(
             """
-            SELECT track_id, COUNT(*) AS cnt
+            SELECT track_id
             FROM chart_entries
-            GROUP BY track_id
-            HAVING COUNT(*) >= 200
-            ORDER BY random()
-            LIMIT 20
-            """
+            WHERE chart_entry_id >= %s
+            ORDER BY chart_entry_id
+            LIMIT 1000
+            """,
+            (start_chart_entry_id,),
         )
         rows = cur.fetchall()
-        samples["chart_track_ids"] = [r[0] for r in rows] if rows else [1]
+        if not rows:
+            cur.execute("SELECT track_id FROM chart_entries ORDER BY chart_entry_id LIMIT 1000")
+            rows = cur.fetchall()
+        seen_track_ids: set[int] = set()
+        chart_track_ids: list[int] = []
+        for (track_id,) in rows:
+            track_id_int = int(track_id)
+            if track_id_int in seen_track_ids:
+                continue
+            seen_track_ids.add(track_id_int)
+            chart_track_ids.append(track_id_int)
+            if len(chart_track_ids) >= 20:
+                break
+        samples["chart_track_ids"] = chart_track_ids if chart_track_ids else [1]
 
-        # artists with existing genres (for list_append – we need one more genre to add)
+        # artists with existing genres (avoid ORDER BY random())
         cur.execute(
             """
-            SELECT artist_id
-            FROM (SELECT DISTINCT artist_id FROM artist_genres) sub
-            ORDER BY random()
+            SELECT DISTINCT artist_id
+            FROM artist_genres
+            ORDER BY artist_id
             LIMIT 20
             """
         )
         rows = cur.fetchall()
-        samples["artist_ids_with_genres"] = [r[0] for r in rows] if rows else [1]
+        samples["artist_ids_with_genres"] = [int(r[0]) for r in rows] if rows else [1]
 
         # all genre ids
         cur.execute("SELECT genre_id FROM genres")
