@@ -522,15 +522,23 @@ def _concurrent_delete_worker(cfg: DbConfig, chunks: list[list[int]]) -> int:
     # Creating thousands of short-lived connections on Windows can exhaust ephemeral ports
     # and fail with WSAEADDRINUSE ("Address already in use").
     with connect_db(cfg) as worker_conn:
+        # connect_db wykonuje SET search_path, co otwiera niejawną transakcję –
+        # commit zamyka ją, żeby można było przełączyć się na autocommit.
+        worker_conn.commit()
+        # Każdy DELETE = osobna krótka transakcja. Dzięki temu zwycięzca kolizji
+        # szybko zwalnia blokady, a przegrany widzi rowcount=0 lub deadlock.
+        worker_conn.autocommit = True
         deleted = 0
-        # Use one transaction for the whole worker batch.
-        with worker_conn.transaction():
-            with worker_conn.cursor() as cur:
-                for ids in chunks:
-                    if not ids:
-                        continue
+        with worker_conn.cursor() as cur:
+            for ids in chunks:
+                if not ids:
+                    continue
+                try:
                     cur.execute("DELETE FROM tracks WHERE track_id = ANY(%s)", (ids,))
                     deleted += int(cur.rowcount or 0)
+                except (psycopg.errors.DeadlockDetected, psycopg.errors.SerializationFailure):
+                    # PostgreSQL sam abortuje jedną z transakcji – liczymy to jako 0.
+                    pass
         return deleted
 
 
@@ -543,22 +551,35 @@ def scenario_concurrent_delete(
 ) -> tuple[float, int]:
     """
     S5 – Concurrent Delete: równoległe usuwanie tracków z wielu wątków.
-    Testuje mechanizmy rozwiązywania blokad (deadlocks, row-level locking).
-    Liczba usuwanych rekordów skaluje się z `scale`, a liczba wątków to `workers`.
+    Testuje mechanizmy rozwiązywania blokad (row-level locking, deadlocki).
+
+    KLUCZOWA ZMIANA vs. naiwna wersja: chunki są częściowo NAKŁADAJĄCE SIĘ
+    (workery losują z tej samej puli ID), więc wątki faktycznie walczą
+    o te same wiersze. Zwycięzca kasuje, przegrany widzi rowcount=0
+    (lub dostaje deadlock, który jest obsłużony wyżej).
     """
     if chunk_size <= 0:
         raise ValueError("chunk_size must be > 0")
 
     delete_count = _scaled_count(scale, 0.0005, min_count=workers, max_count=50000)
     track_ids = _setup_tracks_for_concurrent_delete(conn, count=delete_count)
+    if not track_ids:
+        return 0.0, 0
 
-    # Fixed chunk size: number of DB roundtrips grows with scale.
-    chunks = [track_ids[i : i + chunk_size] for i in range(0, len(track_ids), chunk_size)]
+    # Zbuduj nakładające się chunki: każdy worker dostaje sample z całej puli,
+    # z overlapem ~30–50%. Pierwszy, który zablokuje wiersz – ten go skasuje.
+    # Liczba chunków per worker skaluje się z wielkością puli.
+    chunks_per_worker = max(1, (len(track_ids) + chunk_size - 1) // chunk_size // workers + 1)
 
-    # Assign chunks to workers (each worker keeps one connection and processes many chunks).
-    buckets: list[list[list[int]]] = [[] for _ in range(max(1, workers))]
-    for i, ch in enumerate(chunks):
-        buckets[i % len(buckets)].append(ch)
+    rng = random.Random(uuid.uuid4().int & 0xFFFFFFFF)
+    buckets: list[list[list[int]]] = []
+    for _w in range(workers):
+        worker_chunks: list[list[int]] = []
+        for _c in range(chunks_per_worker):
+            # losowy sample z całej puli – wątki mocno się nakładają
+            sample = rng.sample(track_ids, k=min(chunk_size, len(track_ids)))
+            worker_chunks.append(sample)
+        buckets.append(worker_chunks)
 
     start = time.perf_counter()
     with ThreadPoolExecutor(max_workers=workers) as pool:

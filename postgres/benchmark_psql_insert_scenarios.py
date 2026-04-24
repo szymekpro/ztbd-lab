@@ -87,6 +87,24 @@ def ensure_existing_schema(conn: psycopg.Connection) -> None:
             raise RuntimeError(
                 "Required spotify schema/tables not found. Run init.postgres.sql first."
             )
+        # Heavy-payload scenario wpisuje ~50 KB tekstu do artists.raw_genres_text.
+        # Starsze bazy mają VARCHAR(500) – promujemy do TEXT (idempotentnie).
+        cur.execute(
+            """
+            SELECT data_type, character_maximum_length
+            FROM information_schema.columns
+            WHERE table_schema = 'spotify'
+              AND table_name = 'artists'
+              AND column_name = 'raw_genres_text'
+            """
+        )
+        row = cur.fetchone()
+        if row is not None:
+            data_type, max_len = row[0], row[1]
+            if data_type != 'text' and max_len is not None and max_len < 100_000:
+                cur.execute(
+                    "ALTER TABLE spotify.artists ALTER COLUMN raw_genres_text TYPE TEXT"
+                )
     conn.commit()
 
 
@@ -261,31 +279,28 @@ def scenario_complex_insert_scaled(conn: psycopg.Connection, scale: int) -> int:
     return scenario_complex_insert(conn, items_count=items)
 
 def scenario_bulk_insert(conn: psycopg.Connection, bulk_size: int = 10_000) -> int:
+    # Instrukcja wprost wymaga użycia COPY w PostgreSQL.
+    tag = uuid.uuid4().hex[:5]
+    prefix = f"bk{tag}"  # 7 znaków (22 - 15 na numer)
+
     with conn.transaction():
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO tracks (
-                    spotify_track_id,
-                    name,
-                    explicit,
-                    duration_min,
-                    disc_number,
-                    track_number,
-                    isrc
-                )
-                SELECT
-                    left(md5(clock_timestamp()::text || gs::text || random()::text), 22),
-                    'Bulk Track ' || gs::text,
-                    (random() > 0.5),
-                    round((1.0 + random() * 8.0)::numeric, 3),
-                    1,
-                    1 + (gs %% 20),
-                    NULL
-                FROM generate_series(1, %s) gs
-                """,
-                (bulk_size,),
-            )
+            with cur.copy(
+                "COPY tracks (spotify_track_id, name, explicit, duration_min, disc_number, track_number, isrc) FROM STDIN"
+            ) as copy:
+                for i in range(bulk_size):
+                    spotify_track_id = f"{prefix}{i:015d}"  # 7 + 15 = 22
+                    copy.write_row(
+                        (
+                            spotify_track_id,
+                            f"Bulk Track {i}",
+                            (i % 2 == 0),
+                            round(1.0 + (i % 8) + 0.001 * (i % 1000), 3),
+                            1,
+                            1 + (i % 20),
+                            None,
+                        )
+                    )
 
     return bulk_size
 
@@ -298,7 +313,8 @@ def scenario_bulk_insert_scaled(conn: psycopg.Connection, scale: int, base_bulk_
 
 
 def scenario_heavy_payload_insert(conn: psycopg.Connection, payload_kb: int = 75) -> int:
-    payload_size = min(payload_kb * 1024, 500)
+    # Instrukcja wymaga ~50 KB payloadu – bez dolnego capu 500 B.
+    payload_size = max(payload_kb * 1024, 50 * 1024)
     artist_batch_size = 250
     genres_per_artist = 3
 
@@ -330,43 +346,51 @@ def scenario_heavy_payload_insert(conn: psycopg.Connection, payload_kb: int = 75
     return artist_batch_size + (artist_batch_size * genres_per_artist)
 
 
-def _concurrent_insert_worker(cfg: DbConfig, chunk_sizes: list[int], worker_tag: str) -> int:
-    if not chunk_sizes:
+def _concurrent_insert_worker(cfg: DbConfig, row_count: int, worker_tag: str) -> int:
+    """
+    Symuluje realny ruch aplikacji: worker wykonuje `row_count` niezależnych,
+    krótkich INSERT-ów (po jednym wierszu) – każdy w osobnej transakcji (auto-commit).
+    Dzięki temu mierzymy kontencję na WAL/heap/indeksach i prawdziwą współbieżność,
+    a nie bulk-insert server-side.
+    """
+    if row_count <= 0:
         return 0
 
-    # Reuse a single connection per worker (avoid connection storms on Windows).
+    # Reuse a single connection per worker to avoid WSAEADDRINUSE / connection storms.
     with connect_db(cfg) as worker_conn:
+        # connect_db wykonuje SET search_path, co otwiera niejawną transakcję –
+        # commit zamyka ją, żeby można było przełączyć się na autocommit.
+        worker_conn.commit()
+        worker_conn.autocommit = True  # każdy INSERT = osobna transakcja
         inserted = 0
-        with worker_conn.transaction():
-            with worker_conn.cursor() as cur:
-                for idx, n in enumerate(chunk_sizes):
-                    if n <= 0:
-                        continue
-                    # One statement inserts `n` rows; fixed chunk size => roundtrips scale with dataset.
-                    cur.execute(
-                        """
-                        INSERT INTO tracks (
-                            spotify_track_id,
-                            name,
-                            explicit,
-                            duration_min,
-                            disc_number,
-                            track_number,
-                            isrc
-                        )
-                        SELECT
-                            left(md5(clock_timestamp()::text || random()::text || %s || %s || gs::text), 22),
-                            'Concurrent Bulk Track',
-                            false,
-                            4.200,
-                            1,
-                            1 + (gs %% 20),
-                            NULL
-                        FROM generate_series(1, %s) gs
-                        """,
-                        (worker_tag, str(idx), n),
+        with worker_conn.cursor() as cur:
+            for i in range(row_count):
+                # Unikalne spotify_track_id (22 znaki): tag workera + licznik.
+                spotify_track_id = f"{worker_tag}{i:013d}"[:22].ljust(22, "0")
+                cur.execute(
+                    """
+                    INSERT INTO tracks (
+                        spotify_track_id,
+                        name,
+                        explicit,
+                        duration_min,
+                        disc_number,
+                        track_number,
+                        isrc
                     )
-                    inserted += n
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        spotify_track_id,
+                        f"Concurrent Track {worker_tag} {i}",
+                        False,
+                        4.200,
+                        1,
+                        1 + (i % 20),
+                        None,
+                    ),
+                )
+                inserted += 1
         return inserted
 
 
@@ -376,27 +400,29 @@ def scenario_concurrent_inserts_scaled(
     workers: int,
     chunk_size: int,
 ) -> int:
+    """
+    Uruchamia `workers` wątków, z których każdy wykonuje krótkie, pojedyncze INSERT-y
+    (jeden wiersz per transakcja). Wszystkie wątki piszą do tej samej tabeli `tracks`,
+    więc realnie testujemy kontencję na stronach heapa, WAL-writerze i indeksach.
+    """
     if workers <= 0:
         raise ValueError("workers must be > 0")
     if chunk_size <= 0:
         raise ValueError("chunk_size must be > 0")
 
     total = _scaled_count(scale, 0.002, min_count=workers, max_count=200_000)
-    chunks = [chunk_size] * (total // chunk_size)
-    rem = total % chunk_size
-    if rem:
-        chunks.append(rem)
 
-    buckets: list[list[int]] = [[] for _ in range(workers)]
-    for i, n in enumerate(chunks):
-        buckets[i % workers].append(n)
+    # Rozdziel total na workerów możliwie równo.
+    base = total // workers
+    rem = total % workers
+    per_worker_counts = [base + (1 if i < rem else 0) for i in range(workers)]
 
-    tag = uuid.uuid4().hex[:8]
+    tag = uuid.uuid4().hex[:6]
     with ThreadPoolExecutor(max_workers=workers) as pool:
         inserted = list(
             pool.map(
                 lambda args: _concurrent_insert_worker(cfg, args[0], args[1]),
-                [(buckets[i], f"w{tag}_{i}") for i in range(workers)],
+                [(per_worker_counts[i], f"c{tag}{i:02d}") for i in range(workers)],
             )
         )
     return sum(inserted)
@@ -615,7 +641,9 @@ def main() -> int:
     )
     parser.add_argument("--bulk-size", type=int, default=10000)
     parser.add_argument("--heavy-payload-kb", type=int, default=75)
-    parser.add_argument("--concurrent-workers", type=int, default=100)
+    # Domyślne max_connections w PostgreSQL = 100; 50 workerów + połączenie główne
+    # mieści się w limicie z zapasem, a nadal daje realną kontencję WAL/locków.
+    parser.add_argument("--concurrent-workers", type=int, default=50)
     parser.add_argument(
         "--concurrent-chunk-size",
         type=int,

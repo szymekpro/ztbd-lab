@@ -556,10 +556,12 @@ def run_benchmark(
                 samples = fetch_sample_ids(conn)
 
                 scenarios = [
-                    ("point_update",     lambda: scenario_point_update_scaled(conn, samples, scale=scale)),
+                    # Zgodnie z instrukcją: point_update = korekta literówki po track_id (single row).
+                    ("point_update",     lambda: scenario_point_update(conn, samples)),
                     ("nested_update",    lambda: scenario_nested_update(conn, samples)),
                     ("bulk_update",      lambda: scenario_bulk_update_scaled(conn, samples, scale=scale)),
-                    ("atomic_increment", lambda: scenario_atomic_increment_scaled(conn, samples, scale=scale)),
+                    # Zgodnie z instrukcją: atomic_increment = streams += 1000 dla jednego chart_entry.
+                    ("atomic_increment", lambda: scenario_atomic_increment(conn, samples)),
                     ("list_append",      lambda: scenario_list_append(conn, samples)),
                     ("cas_update",       lambda: scenario_cas_update(conn, samples)),
                 ]

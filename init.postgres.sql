@@ -31,7 +31,7 @@ CREATE TABLE IF NOT EXISTS markets (
 CREATE TABLE IF NOT EXISTS artists (
   artist_id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   name               VARCHAR(255) NOT NULL,
-  raw_genres_text    VARCHAR(500),
+  raw_genres_text    TEXT,
   created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at         TIMESTAMPTZ
 );
