@@ -80,15 +80,100 @@ def connect_db(cfg: DbConfig):
 
 
 def ensure_schema(db) -> None:
-    required = {"tracks"}
+    # For benchmarks we only need collections + indexes; validators are optional.
+    required = {
+        "chart_entries",
+        "charts",
+        "audio_features",
+        "track_albums",
+        "track_artists",
+        "album_artists",
+        "artist_genres",
+        "tracks",
+        "albums",
+        "artists",
+        "markets",
+        "genres",
+    }
     existing = set(db.list_collection_names())
-    if not required.issubset(existing):
-        raise RuntimeError(
-            "Schema not found (missing tracks collection). Start DB with docker-compose so init.mongo.js runs."
-        )
+    missing = sorted(required - existing)
+    for name in missing:
+        try:
+            db.create_collection(name)
+        except Exception:
+            # NamespaceExists or lack of privilege: ignore.
+            pass
+
+    ensure_base_indexes(db)
 
 
-def truncate_all(db) -> None:
+def ensure_base_indexes(db) -> None:
+    """Recreate indexes normally created by init.mongo.js.
+
+    This matters because fast truncation uses collection.drop(), which removes indexes.
+    Keeping base (schema) indexes preserves benchmark behavior (e.g., list_append uniqueness).
+    """
+
+    # genres
+    db.genres.create_index([("name", 1)], unique=True, name="name_1")
+
+    # markets
+    db.markets.create_index(
+        [("country_code", 1)],
+        unique=True,
+        name="country_code_1",
+        partialFilterExpression={"country_code": {"$type": "string"}},
+    )
+
+    # artists
+    db.artists.create_index([("name", 1)], name="name_1")
+
+    # albums
+    db.albums.create_index(
+        [("spotify_album_id", 1)],
+        unique=True,
+        name="spotify_album_id_1",
+        partialFilterExpression={"spotify_album_id": {"$type": "string"}},
+    )
+    db.albums.create_index([("name", 1)], name="name_1")
+    db.albums.create_index([("release_date", 1)], name="release_date_1")
+
+    # tracks
+    db.tracks.create_index([("spotify_track_id", 1)], unique=True, name="spotify_track_id_1")
+    db.tracks.create_index(
+        [("isrc", 1)],
+        unique=True,
+        name="isrc_1",
+        partialFilterExpression={"isrc": {"$type": "string"}},
+    )
+    db.tracks.create_index([("name", 1)], name="name_1")
+
+    # relations
+    db.artist_genres.create_index([("artist_id", 1), ("genre_id", 1)], unique=True, name="artist_id_1_genre_id_1")
+    db.album_artists.create_index([("album_id", 1), ("artist_id", 1)], unique=True, name="album_id_1_artist_id_1")
+    db.track_artists.create_index([("track_id", 1), ("artist_id", 1)], unique=True, name="track_id_1_artist_id_1")
+    db.track_albums.create_index([("track_id", 1), ("album_id", 1)], unique=True, name="track_id_1_album_id_1")
+    db.audio_features.create_index([("track_id", 1)], unique=True, name="track_id_1")
+
+    # charts
+    db.charts.create_index(
+        [("provider", 1), ("name", 1), ("market_id", 1)],
+        unique=True,
+        name="provider_1_name_1_market_id_1",
+        partialFilterExpression={"market_id": {"$type": ["int", "long", "double", "decimal"]}},
+    )
+
+    # chart_entries
+    db.chart_entries.create_index([("chart_id", 1), ("chart_date", 1)], name="chart_id_1_chart_date_1")
+    db.chart_entries.create_index([("track_id", 1), ("chart_date", 1)], name="track_id_1_chart_date_1")
+    db.chart_entries.create_index(
+        [("chart_id", 1), ("track_id", 1), ("chart_date", 1)],
+        unique=True,
+        name="chart_id_1_track_id_1_chart_date_1",
+    )
+
+
+def truncate_all(db, *, mode: str = "drop") -> None:
     tables = [
         "chart_entries",
         "charts",
@@ -103,8 +188,25 @@ def truncate_all(db) -> None:
         "markets",
         "genres",
     ]
+
+    if mode not in {"drop", "delete"}:
+        raise ValueError("truncate mode must be 'drop' or 'delete'")
+
+    print(f"[TRUNCATE] mode={mode} – czyszczenie kolekcji...")
     for table in tables:
-        db[table].delete_many({})
+        if mode == "drop":
+            try:
+                db[table].drop()
+            except Exception:
+                pass
+            try:
+                db.create_collection(table)
+            except Exception:
+                pass
+        else:
+            # Slow on large scales (updates indexes per delete) but preserves validators.
+            db[table].delete_many({})
+    print("[TRUNCATE] gotowe.")
 
 
 def seed_genres(db, fake: Faker, n: int) -> list[int]:
@@ -247,7 +349,8 @@ def seed_tracks(db, fake: Faker, n: int, pool_size: int, seed: Optional[int]) ->
     ]
 
     docs: list[dict] = []
-    track_ids: list[int] = []
+    # Keep only a small sample of IDs for charts (avoid huge in-memory lists).
+    chart_track_ids: list[int] = []
     now = datetime.now(tz=timezone.utc)
     for i in range(1, n + 1):
         spotify_track_id = spotify_id_from_int(i - 1, "t")
@@ -271,16 +374,14 @@ def seed_tracks(db, fake: Faker, n: int, pool_size: int, seed: Optional[int]) ->
             db.tracks.insert_many(docs, ordered=False)
             docs.clear()
 
-        # Only keep explicit ids for small-ish scales (used for charts sampling etc.).
-        if n <= 1_000_000:
-            track_ids.append(i)
+        # Keep a small deterministic sample for chart seeding.
+        if i <= 5000:
+            chart_track_ids.append(i)
 
     if docs:
         db.tracks.insert_many(docs, ordered=False)
 
-    if n <= 1_000_000:
-        return track_ids
-    return list(range(1, min(n, 5000) + 1))
+    return chart_track_ids
 
 
 def seed_relations(
@@ -288,7 +389,7 @@ def seed_relations(
     artist_ids: list[int],
     genre_ids: list[int],
     album_ids: list[int],
-    track_ids: list[int],
+    n_tracks: int,
     genres_per_artist: int = 2,
     artists_per_album: int = 1,
     artists_per_track: int = 2,
@@ -324,8 +425,8 @@ def seed_relations(
                     db.album_artists.insert_many(album_artists_docs, ordered=False)
                     album_artists_docs.clear()
 
-    if track_ids and artist_ids:
-        for track_id in track_ids:
+    if n_tracks > 0 and artist_ids:
+        for track_id in range(1, int(n_tracks) + 1):
             for gs in range(1, max(1, artists_per_track) + 1):
                 artist_idx = (track_id - 1 + gs - 1) % len(artist_ids)
                 track_artists_docs.append(
@@ -340,8 +441,8 @@ def seed_relations(
                     db.track_artists.insert_many(track_artists_docs, ordered=False)
                     track_artists_docs.clear()
 
-    if track_ids and album_ids:
-        for track_id in track_ids:
+    if n_tracks > 0 and album_ids:
+        for track_id in range(1, int(n_tracks) + 1):
             album_idx = (track_id - 1) % len(album_ids)
             track_albums_docs.append(
                 {
@@ -365,9 +466,9 @@ def seed_relations(
         db.track_albums.insert_many(track_albums_docs, ordered=False)
 
 
-def seed_audio_features(db, track_ids: list[int], seed: Optional[int]) -> None:
+def seed_audio_features(db, n_tracks: int, seed: Optional[int]) -> None:
     docs: list[dict] = []
-    for track_id in track_ids:
+    for track_id in range(1, int(n_tracks) + 1):
         docs.append(
             {
                 "track_id": track_id,
@@ -462,27 +563,48 @@ def seed_all(
     n_tracks: int,
     seed: Optional[int] = None,
     truncate: bool = False,
+    truncate_mode: str = "drop",
     pool_size: int = 10000,
+    relations_track_cap: Optional[int] = None,
+    audio_features_track_cap: Optional[int] = None,
 ) -> None:
     fake = Faker()
     if seed is not None:
         fake.seed_instance(seed)
 
-    ensure_schema(db)
+    # Important: truncate first.
+    # Ensuring indexes on an already-large dataset can look like a hang if an index is missing.
     if truncate:
-        truncate_all(db)
+        truncate_all(db, mode=truncate_mode)
+    ensure_schema(db)
 
     genre_ids = seed_genres(db, fake, n=n_genres)
     market_ids = seed_markets(db)
     artist_ids = seed_artists(db, fake, n=n_artists, pool_size=pool_size, seed=seed)
     album_ids = seed_albums(db, fake, n=n_albums, pool_size=pool_size, seed=seed)
-    track_ids = seed_tracks(db, fake, n=n_tracks, pool_size=pool_size, seed=seed)
+    chart_track_ids = seed_tracks(db, fake, n=n_tracks, pool_size=pool_size, seed=seed)
 
-    seed_relations(db, artist_ids, genre_ids, album_ids, track_ids)
-    seed_audio_features(db, track_ids, seed=seed)
+    # For large scales, fully materializing track_albums/track_artists/audio_features can be
+    # prohibitively expensive in Mongo. Allow capping while keeping benchmarks meaningful.
+    def _cap(total: int, cap: Optional[int]) -> int:
+        if cap is None:
+            return int(total)
+        cap_i = int(cap)
+        if cap_i <= 0:
+            return int(total)
+        return int(min(int(total), cap_i))
+
+    relations_n_tracks = _cap(n_tracks, relations_track_cap)
+    if audio_features_track_cap is None:
+        audio_features_n_tracks = relations_n_tracks
+    else:
+        audio_features_n_tracks = _cap(n_tracks, audio_features_track_cap)
+
+    seed_relations(db, artist_ids, genre_ids, album_ids, relations_n_tracks)
+    seed_audio_features(db, audio_features_n_tracks, seed=seed)
 
     chart_ids = seed_charts(db, market_ids)
-    seed_chart_entries(db, chart_ids, track_ids[:5000], seed=seed)
+    seed_chart_entries(db, chart_ids, chart_track_ids[:5000], seed=seed)
 
 
 def main() -> int:
@@ -499,10 +621,30 @@ def main() -> int:
         help="Delete all spotify collections before seeding.",
     )
     parser.add_argument(
+        "--truncate-mode",
+        choices=["drop", "delete"],
+        default="drop",
+        help="How to truncate: 'drop' (fast, drops collections + recreates indexes) or 'delete' (slow for big scales).",
+    )
+    parser.add_argument(
         "--pool-size",
         type=int,
         default=10000,
         help="Size of Faker-generated name pools (higher = more variety, slower startup).",
+    )
+
+    parser.add_argument(
+        "--relations-track-cap",
+        type=int,
+        default=1200000,
+        help="Cap how many tracks get relations (track_artists/track_albums) seeded. "
+        "Default: 1200000 (use 0 to disable cap).",
+    )
+    parser.add_argument(
+        "--audio-features-track-cap",
+        type=int,
+        default=1200000,
+        help="Cap how many tracks get audio_features seeded. Default: 1200000 (use 0 to disable cap).",
     )
 
     parser.add_argument("--db-host", default=os.getenv("DB_HOST", "localhost"))
@@ -533,7 +675,10 @@ def main() -> int:
             n_tracks=args.tracks,
             seed=args.seed,
             truncate=args.truncate,
+            truncate_mode=args.truncate_mode,
             pool_size=args.pool_size,
+            relations_track_cap=args.relations_track_cap,
+            audio_features_track_cap=args.audio_features_track_cap,
         )
     finally:
         client.close()
