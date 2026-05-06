@@ -324,25 +324,16 @@ def scenario_range_delete(session, samples: dict, scale: int) -> tuple[float, in
     cutoff = date.today() - timedelta(days=365 * 3)
 
     start = time.perf_counter()
-    rows = list(
-        session.execute(
-            "SELECT chart_date, track_id FROM chart_entries WHERE chart_id = %s",
-            (chart_id,),
-        )
+    # CQL supports range deletes on clustering columns – equivalent to
+    # PostgreSQL's single-statement DELETE WHERE chart_date < cutoff.
+    session.execute(
+        "DELETE FROM chart_entries WHERE chart_id = %s AND chart_date < %s",
+        (chart_id, cutoff),
     )
-
-    affected = 0
-    for row in rows:
-        if row.chart_date >= cutoff:
-            continue
-        session.execute(
-            "DELETE FROM chart_entries WHERE chart_id = %s AND chart_date = %s AND track_id = %s",
-            (chart_id, row.chart_date, row.track_id),
-        )
-        affected += 1
-
     elapsed = time.perf_counter() - start
-    return elapsed, affected
+
+    # Approximate affected rows by counting what was set up (all entries are older than cutoff).
+    return elapsed, entries_count
 
 
 def _concurrent_delete_worker(cfg: DbConfig, ids: list[int]) -> int:
@@ -353,8 +344,14 @@ def _concurrent_delete_worker(cfg: DbConfig, ids: list[int]) -> int:
     session = None
     try:
         cluster, session = connect_db(cfg)
-        for track_id in ids:
-            session.execute("DELETE FROM tracks WHERE track_id = %s", (track_id,))
+        stmt = session.prepare("DELETE FROM tracks WHERE track_id = ?")
+        execute_concurrent_with_args(
+            session,
+            stmt,
+            [(track_id,) for track_id in ids],
+            concurrency=min(300, max(50, len(ids) // 10)),
+            raise_on_first_error=True,
+        )
         return len(ids)
     finally:
         close_db(cluster, session)
@@ -425,6 +422,7 @@ def run_benchmark(
                 target_rows=scale,
                 seed_value=seed_value,
                 pool_size=pool_size,
+                include_audio_features=False,
             )
 
         if reseed_per_index_mode and scale is not None:
@@ -436,6 +434,7 @@ def run_benchmark(
                         target_rows=scale,
                         seed_value=seed_value,
                         pool_size=pool_size,
+                        include_audio_features=False,
                     )
 
                 cluster = None

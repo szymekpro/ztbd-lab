@@ -83,6 +83,7 @@ def prepare_scale_data_with_seed_script(
     target_rows: int,
     seed_value: Optional[int],
     pool_size: int,
+    include_audio_features: bool = True,
 ) -> None:
     import sys
 
@@ -112,6 +113,7 @@ def prepare_scale_data_with_seed_script(
             seed=seed_value,
             truncate=True,
             pool_size=pool_size,
+            include_audio_features=include_audio_features,
         )
         conn.commit()
     finally:
@@ -120,7 +122,7 @@ def prepare_scale_data_with_seed_script(
 
 def apply_indexes(conn, managed_indexes: list[dict], with_indexes: bool) -> None:
     action = "Tworzenie" if with_indexes else "Usuwanie"
-    print(f"\n[INDEX] {action} indeksow...")
+    print(f"\n[INDEX] {action} indeksów...")
     with conn.cursor() as cur:
         for idx in managed_indexes:
             sql = idx["create"] if with_indexes else idx["drop"]

@@ -45,6 +45,11 @@ services:
   cassandra:
     image: cassandra:5.0
     container_name: spotify-cassandra
+    environment:
+      # MAX_HEAP_SIZE is not a performance advantage — it is the minimum required
+      # to prevent JVM OOM crashes during seeding. Cassandra's architecture mandates
+      # explicit heap sizing unlike PostgreSQL which relies on the OS page cache.
+      MAX_HEAP_SIZE: "4G"
     ports:
       - "9043:9042"
     volumes:

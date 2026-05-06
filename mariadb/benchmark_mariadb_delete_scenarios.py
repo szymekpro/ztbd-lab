@@ -36,6 +36,18 @@ MANAGED_INDEXES = [
         "drop": "DROP INDEX IF EXISTS idx_albums_release_date ON albums",
         "new": False,
     },
+    {
+        "name": "idx_track_albums_album_id",
+        "create": "CREATE INDEX IF NOT EXISTS idx_track_albums_album_id ON track_albums(album_id)",
+        "drop": "DROP INDEX IF EXISTS idx_track_albums_album_id ON track_albums",
+        "new": True,
+    },
+    {
+        "name": "idx_track_artists_artist_id",
+        "create": "CREATE INDEX IF NOT EXISTS idx_track_artists_artist_id ON track_artists(artist_id)",
+        "drop": "DROP INDEX IF EXISTS idx_track_artists_artist_id ON track_artists",
+        "new": True,
+    },
 ]
 
 
@@ -70,7 +82,7 @@ def fetch_sample_ids(conn) -> dict:
         rows = cur.fetchall()
         samples["artist_ids"] = [int(r[0]) for r in rows] if rows else [1]
 
-    print("[SETUP] Zaladowano sample IDs:")
+    print("[SETUP] Załadowano sample IDs:")
     print(f"  chart_id:    {samples['chart_id']}")
     print(f"  album_ids:   {len(samples['album_ids'])}")
     print(f"  artist_ids:  {len(samples['artist_ids'])}")
@@ -366,6 +378,7 @@ def run_benchmark(
                 target_rows=scale,
                 seed_value=seed_value,
                 pool_size=pool_size,
+                include_audio_features=False,
             )
 
         if reseed_per_index_mode and scale is not None:
@@ -377,6 +390,7 @@ def run_benchmark(
                         target_rows=scale,
                         seed_value=seed_value,
                         pool_size=pool_size,
+                        include_audio_features=False,
                     )
 
                 with connect_db(cfg) as conn:

@@ -24,8 +24,8 @@ class DbConfig:
 
 @dataclass(frozen=True)
 class WriteTuning:
-    concurrency: int = 300
-    chunk_size: int = 20000
+    concurrency: int = 500
+    chunk_size: int = 50000
     progress_every: int = 200000
 
 
@@ -131,6 +131,10 @@ def ensure_schema(session, keyspace: str) -> None:
         )
 
 
+_SEED_RETRY_ATTEMPTS = 4
+_SEED_RETRY_BACKOFF = [2.0, 5.0, 15.0]  # seconds between retries
+
+
 def insert_many(
     session,
     cql: str,
@@ -140,8 +144,12 @@ def insert_many(
 ) -> int:
     try:
         from cassandra.concurrent import execute_concurrent_with_args
+        from cassandra.cluster import NoHostAvailable
+        from cassandra import OperationTimedOut, WriteTimeout, WriteFailure
     except ImportError as e:  # pragma: no cover
         raise RuntimeError("Missing cassandra-driver") from e
+
+    _transient = (NoHostAvailable, OperationTimedOut, WriteTimeout, WriteFailure, ConnectionError)
 
     iterator = iter(rows)
     statement = session.prepare(cql)
@@ -152,13 +160,24 @@ def insert_many(
         batch = list(islice(iterator, tuning.chunk_size))
         if not batch:
             break
-        execute_concurrent_with_args(
-            session,
-            statement,
-            batch,
-            concurrency=tuning.concurrency,
-            raise_on_first_error=True,
-        )
+
+        for attempt in range(_SEED_RETRY_ATTEMPTS):
+            try:
+                execute_concurrent_with_args(
+                    session,
+                    statement,
+                    batch,
+                    concurrency=tuning.concurrency,
+                    raise_on_first_error=True,
+                )
+                break
+            except _transient as exc:
+                if attempt >= _SEED_RETRY_ATTEMPTS - 1:
+                    raise
+                wait = _SEED_RETRY_BACKOFF[min(attempt, len(_SEED_RETRY_BACKOFF) - 1)]
+                print(f"[SEED] {label}: transient error (attempt {attempt + 1}), retry in {wait:.0f}s — {exc}")
+                pytime.sleep(wait)
+
         loaded += len(batch)
         if tuning.progress_every > 0 and loaded % tuning.progress_every == 0:
             elapsed = pytime.perf_counter() - started
@@ -552,6 +571,7 @@ def seed_all(
     pool_size: int = 10000,
     write_tuning: WriteTuning = WriteTuning(),
     fast_mode: bool = False,
+    include_audio_features: bool = True,
 ) -> None:
     fake = Faker()
     if seed is not None:
@@ -577,7 +597,9 @@ def seed_all(
         tuning=write_tuning,
         artists_per_track=artists_per_track,
     )
-    if not fast_mode:
+
+    _seed_audio = include_audio_features and not fast_mode
+    if _seed_audio:
         seed_audio_features(session, n_tracks=track_count, seed=seed, tuning=write_tuning)
 
     chart_ids = seed_charts(session, market_count, tuning=write_tuning)

@@ -119,7 +119,6 @@ def scenario_partition_read(session, samples: dict) -> int:
             SELECT track_id, album_id, is_primary
             FROM track_albums
             WHERE album_id = %s
-            LIMIT 5000
             ALLOW FILTERING
             """,
             (album_id,),
@@ -137,6 +136,7 @@ def scenario_top_n_ranking_scaled(session, samples: dict, scale: int) -> int:
             SELECT chart_id, chart_date, track_id, position, streams
             FROM chart_entries
             WHERE chart_id = %s
+            ORDER BY chart_date DESC
             LIMIT %s
             """,
             (chart_id, limit_n),
@@ -245,6 +245,7 @@ def run_benchmark(
                 target_rows=scale,
                 seed_value=seed_value,
                 pool_size=pool_size,
+                include_audio_features=True,
             )
 
         cluster = None

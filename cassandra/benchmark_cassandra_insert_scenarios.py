@@ -405,6 +405,7 @@ def run_benchmark(
                     target_rows=scale,
                     seed_value=seed_value,
                     pool_size=pool_size,
+                    include_audio_features=False,
                 )
 
             cluster = None

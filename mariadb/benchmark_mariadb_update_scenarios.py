@@ -29,6 +29,18 @@ MANAGED_INDEXES = [
         "new": False,
     },
     {
+        "name": "idx_artist_genres_artist_id",
+        "create": "CREATE INDEX IF NOT EXISTS idx_artist_genres_artist_id ON artist_genres(artist_id)",
+        "drop": "DROP INDEX IF EXISTS idx_artist_genres_artist_id ON artist_genres",
+        "new": True,
+    },
+    {
+        "name": "idx_track_artists_artist_id",
+        "create": "CREATE INDEX IF NOT EXISTS idx_track_artists_artist_id ON track_artists(artist_id)",
+        "drop": "DROP INDEX IF EXISTS idx_track_artists_artist_id ON track_artists",
+        "new": True,
+    },
+    {
         "name": "idx_tracks_explicit",
         "create": "CREATE INDEX IF NOT EXISTS idx_tracks_explicit ON tracks(explicit)",
         "drop": "DROP INDEX IF EXISTS idx_tracks_explicit ON tracks",
@@ -85,7 +97,7 @@ def fetch_sample_ids(conn) -> dict:
         rows = cur.fetchall()
         samples["bulk_genre_ids"] = [int(r[0]) for r in rows] if rows else [1]
 
-    print("[SETUP] Zaladowano sample IDs:")
+    print("[SETUP] Załadowano sample IDs:")
     print(f"  track_ids (z audio_features): {len(samples['track_ids'])}")
     print(f"  max_track_id:                 {samples['max_track_id']}")
     print(f"  chart_entries:                {len(samples['chart_entries'])}")
@@ -230,6 +242,7 @@ def run_benchmark(
                     target_rows=scale,
                     seed_value=seed_value,
                     pool_size=pool_size,
+                    include_audio_features=True,
                 )
 
             with connect_db(cfg) as conn:

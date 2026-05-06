@@ -3,6 +3,7 @@ import os
 import random
 import string
 import tempfile
+import time
 from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
@@ -119,20 +120,15 @@ def _load_local_infile(conn, table: str, columns: list[str], tsv_path: Path) -> 
     with conn.cursor() as cur:
         cur.execute(sql)
         loaded = int(cur.rowcount)
-        msg = getattr(getattr(cur, "_result", None), "message", None)
-        if isinstance(msg, (bytes, bytearray)):
-            msg = msg.decode("utf-8", errors="replace")
-        if msg:
-            print(f"LOAD DATA {table}: {msg}")
 
-        # If there were warnings, show a small sample.
-        # (SHOW WARNINGS returns only the last statement's warnings.)
+        # Show only actual warnings (not Notes, which are routine).
         cur.execute("SHOW WARNINGS LIMIT 5")
-        warnings = cur.fetchall()
-        if warnings:
-            print(f"LOAD DATA {table}: first warnings:")
-            for level, code, message in warnings:
-                print(f"  - {level} {code}: {message}")
+        warns = cur.fetchall()
+        errors = [(lvl, code, msg) for lvl, code, msg in warns if str(lvl).upper() != "NOTE"]
+        if errors:
+            print(f"[SEED] {table}: warnings:")
+            for lvl, code, msg in errors:
+                print(f"  - {lvl} {code}: {msg}")
 
         return loaded
 
@@ -252,9 +248,13 @@ def seed_artists(conn, fake: Faker, n: int, pool_size: int, seed: Optional[int])
                 yield (f"{name} {i}" if n > len(name_pool) else name, raw_genres_text)
 
         _write_tsv(path, rows())
+        t0 = time.perf_counter()
         loaded = _load_local_infile(conn, "artists", ["name", "raw_genres_text"], path)
+        elapsed = time.perf_counter() - t0
         if loaded != n:
-            print(f"Loaded artists: {loaded}/{n}")
+            print(f"[SEED] artists: {loaded}/{n} rows ({elapsed:.1f}s) [WARNING: count mismatch]")
+        else:
+            print(f"[SEED] artists: {loaded} rows ({elapsed:.1f}s)")
     conn.commit()
 
 
@@ -279,14 +279,18 @@ def seed_albums(conn, fake: Faker, n: int, pool_size: int, seed: Optional[int]) 
                 yield (spotify_album_id, name, album_type, str(release), total_tracks)
 
         _write_tsv(path, rows())
+        t0 = time.perf_counter()
         loaded = _load_local_infile(
             conn,
             "albums",
             ["spotify_album_id", "name", "album_type", "release_date", "total_tracks"],
             path,
         )
+        elapsed = time.perf_counter() - t0
         if loaded != n:
-            print(f"Loaded albums: {loaded}/{n}")
+            print(f"[SEED] albums: {loaded}/{n} rows ({elapsed:.1f}s) [WARNING: count mismatch]")
+        else:
+            print(f"[SEED] albums: {loaded} rows ({elapsed:.1f}s)")
     conn.commit()
 
 
@@ -321,6 +325,7 @@ def seed_tracks(conn, fake: Faker, n: int, pool_size: int, seed: Optional[int]) 
                 )
 
         _write_tsv(path, rows())
+        t0 = time.perf_counter()
         loaded = _load_local_infile(
             conn,
             "tracks",
@@ -335,10 +340,11 @@ def seed_tracks(conn, fake: Faker, n: int, pool_size: int, seed: Optional[int]) 
             ],
             path,
         )
+        elapsed = time.perf_counter() - t0
         if loaded != n:
-            print(
-                f"Loaded tracks: {loaded}/{n} (if this is unexpected, verify your command line and whether you used --truncate)"
-            )
+            print(f"[SEED] tracks: {loaded}/{n} rows ({elapsed:.1f}s) [WARNING: verify --truncate was used]")
+        else:
+            print(f"[SEED] tracks: {loaded} rows ({elapsed:.1f}s)")
     conn.commit()
 
 
@@ -526,6 +532,7 @@ def seed_all(
     seed: Optional[int] = None,
     truncate: bool = False,
     pool_size: int = 10000,
+    include_audio_features: bool = True,
 ) -> None:
     fake = Faker()
     if seed is not None:
@@ -542,7 +549,8 @@ def seed_all(
     seed_tracks(conn, fake, n=n_tracks, pool_size=pool_size, seed=seed)
 
     seed_relations_fast(conn)
-    seed_audio_features_fast(conn)
+    if include_audio_features:
+        seed_audio_features_fast(conn)
 
     # Charts are tiny; keep simple approach.
     with conn.cursor() as cur:

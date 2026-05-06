@@ -10,6 +10,8 @@ from decimal import Decimal
 from statistics import mean
 from typing import Optional
 
+from cassandra.concurrent import execute_concurrent_with_args
+
 from benchmark_cassandra_common import (
     DbConfig,
     apply_indexes,
@@ -111,13 +113,17 @@ def scenario_point_update_scaled(session, samples: dict, scale: int) -> int:
     ids = [random.choice(samples["track_ids"]) for _ in range(n)]
     now = _now()
 
-    for track_id in ids:
-        session.execute(
-            "UPDATE tracks SET name = %s, updated_at = %s WHERE track_id = %s",
-            (f"Batch Updated {track_id % 1000000}", now, track_id),
-        )
+    stmt = session.prepare("UPDATE tracks SET name = ?, updated_at = ? WHERE track_id = ?")
+    params = [(f"Batch Updated {track_id % 1000000}", now, track_id) for track_id in ids]
+    execute_concurrent_with_args(
+        session,
+        stmt,
+        params,
+        concurrency=min(300, max(50, n // 10)),
+        raise_on_first_error=True,
+    )
 
-    return len(ids)
+    return n
 
 
 def scenario_nested_update(session, samples: dict) -> int:
@@ -260,6 +266,7 @@ def run_benchmark(
                     target_rows=scale,
                     seed_value=seed_value,
                     pool_size=pool_size,
+                    include_audio_features=True,
                 )
 
             cluster = None

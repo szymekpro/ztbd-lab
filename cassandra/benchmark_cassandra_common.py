@@ -123,6 +123,7 @@ def prepare_scale_data_with_seed_script(
     target_rows: int,
     seed_value: Optional[int],
     pool_size: int,
+    include_audio_features: bool = True,
 ) -> None:
     import sys
 
@@ -155,6 +156,7 @@ def prepare_scale_data_with_seed_script(
             truncate=True,
             pool_size=pool_size,
             fast_mode=False,
+            include_audio_features=include_audio_features,
         )
     finally:
         if session is not None:
