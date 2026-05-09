@@ -13,9 +13,9 @@ Important differences vs PostgreSQL:
   Scenario `cascade_delete` is therefore *mocked* as a client-driven multi-collection
   delete (albums + album_artists + track_albums).
 
-Output CSV schema matches visualization/plot_results.py expectations.
-Default output filename matches PostgreSQL so plot_results.py works unchanged
-when called with --results-dir ../mongodb/results.
+Output CSV schema matches plot_results.py expectations.
+Default output filename follows the repo convention so plot_results.py can load it
+automatically when run from the repo root.
 """
 
 from __future__ import annotations

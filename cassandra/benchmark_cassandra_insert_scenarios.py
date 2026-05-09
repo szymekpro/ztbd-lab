@@ -23,6 +23,7 @@ from benchmark_cassandra_common import (
     random_text,
     scaled_count,
     timed_run,
+    wait_for_secondary_indexes,
 )
 
 
@@ -417,6 +418,9 @@ def run_benchmark(
 
                 artist_ids, album_ids, genre_ids = _sample_ids(session)
 
+                if with_indexes:
+                    wait_for_secondary_indexes(session, MANAGED_INDEXES, max_total_seconds=600.0, step_seconds=30.0)
+
                 scenarios = [
                     ("single_insert", lambda: scenario_single_insert(session)),
                     (
@@ -445,7 +449,14 @@ def run_benchmark(
 
                 for scenario_name, scenario_fn in scenarios:
                     for run_idx in range(1, runs_per_scenario + 1):
-                        elapsed, ops = timed_run(scenario_fn)
+                        try:
+                            elapsed, ops = timed_run(scenario_fn)
+                        except Exception as exc:
+                            print(
+                                f"[WARN] insert scenario failed: scale={scale}, index_mode={index_label}, "
+                                f"scenario={scenario_name}, run={run_idx} — {type(exc).__name__}: {exc}"
+                            )
+                            continue
                         results.append(
                             {
                                 "scale": scale,

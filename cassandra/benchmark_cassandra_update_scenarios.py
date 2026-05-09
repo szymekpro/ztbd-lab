@@ -10,6 +10,7 @@ from decimal import Decimal
 from statistics import mean
 from typing import Optional
 
+from cassandra import InvalidRequest
 from cassandra.concurrent import execute_concurrent_with_args
 
 from benchmark_cassandra_common import (
@@ -22,6 +23,7 @@ from benchmark_cassandra_common import (
     prepare_scale_data_with_seed_script,
     scaled_count,
     timed_run,
+    wait_for_secondary_indexes,
 )
 
 
@@ -140,12 +142,20 @@ def scenario_bulk_update_scaled(session, samples: dict, scale: int) -> int:
     genre_id = random.choice(samples["bulk_genre_ids"])
     limit_n = scaled_count(scale, 0.001, min_count=2_000, max_count=200_000)
 
-    artists = list(
-        session.execute(
-            "SELECT artist_id FROM artist_genres WHERE genre_id = %s LIMIT 2000 ALLOW FILTERING",
-            (genre_id,),
+    try:
+        artists = list(
+            session.execute(
+                "SELECT artist_id FROM artist_genres WHERE genre_id = %s LIMIT 2000",
+                (genre_id,),
+            )
         )
-    )
+    except InvalidRequest:
+        artists = list(
+            session.execute(
+                "SELECT artist_id FROM artist_genres WHERE genre_id = %s LIMIT 2000 ALLOW FILTERING",
+                (genre_id,),
+            )
+        )
     if not artists:
         return 0
 
@@ -153,10 +163,17 @@ def scenario_bulk_update_scaled(session, samples: dict, scale: int) -> int:
     for artist_row in artists:
         if len(target_track_ids) >= limit_n:
             break
-        links = session.execute(
-            "SELECT track_id FROM track_artists WHERE artist_id = %s LIMIT %s ALLOW FILTERING",
-            (artist_row.artist_id, min(5000, limit_n)),
-        )
+        per_artist_limit = min(5000, limit_n)
+        try:
+            links = session.execute(
+                "SELECT track_id FROM track_artists WHERE artist_id = %s LIMIT %s",
+                (artist_row.artist_id, per_artist_limit),
+            )
+        except InvalidRequest:
+            links = session.execute(
+                "SELECT track_id FROM track_artists WHERE artist_id = %s LIMIT %s ALLOW FILTERING",
+                (artist_row.artist_id, per_artist_limit),
+            )
         for link in links:
             target_track_ids.append(int(link.track_id))
             if len(target_track_ids) >= limit_n:
@@ -179,18 +196,31 @@ def scenario_atomic_increment_scaled(session, samples: dict, scale: int) -> int:
     track_id = random.choice(samples.get("chart_track_ids", [1]))
     limit_n = scaled_count(scale, 0.0002, min_count=500, max_count=50_000)
 
-    rows = list(
-        session.execute(
-            """
-            SELECT chart_id, chart_date, track_id, streams
-            FROM chart_entries
-            WHERE track_id = %s
-            LIMIT %s
-            ALLOW FILTERING
-            """,
-            (track_id, limit_n),
+    try:
+        rows = list(
+            session.execute(
+                """
+                SELECT chart_id, chart_date, track_id, streams
+                FROM chart_entries
+                WHERE track_id = %s
+                LIMIT %s
+                """,
+                (track_id, limit_n),
+            )
         )
-    )
+    except InvalidRequest:
+        rows = list(
+            session.execute(
+                """
+                SELECT chart_id, chart_date, track_id, streams
+                FROM chart_entries
+                WHERE track_id = %s
+                LIMIT %s
+                ALLOW FILTERING
+                """,
+                (track_id, limit_n),
+            )
+        )
 
     if not rows:
         return 0
@@ -277,6 +307,9 @@ def run_benchmark(
                 apply_indexes(session, MANAGED_INDEXES, with_indexes)
                 samples = fetch_sample_ids(session)
 
+                if with_indexes:
+                    wait_for_secondary_indexes(session, MANAGED_INDEXES, max_total_seconds=600.0, step_seconds=30.0)
+
                 scenarios = [
                     ("point_update", lambda: scenario_point_update_scaled(session, samples, scale=scale)),
                     ("nested_update", lambda: scenario_nested_update(session, samples)),
@@ -288,7 +321,14 @@ def run_benchmark(
 
                 for scenario_name, scenario_fn in scenarios:
                     for run_idx in range(1, runs_per_scenario + 1):
-                        elapsed, ops = timed_run(scenario_fn)
+                        try:
+                            elapsed, ops = timed_run(scenario_fn)
+                        except Exception as exc:
+                            print(
+                                f"[WARN] update scenario failed: scale={scale}, index_mode={index_label}, "
+                                f"scenario={scenario_name}, run={run_idx} — {type(exc).__name__}: {exc}"
+                            )
+                            continue
                         results.append(
                             {
                                 "scale": scale,

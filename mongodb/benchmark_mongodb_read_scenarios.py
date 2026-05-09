@@ -10,9 +10,9 @@ Scenarios (same names as in postgres/benchmark_psql_read_scenarios.py):
 
 Notes:
 - SQL JOIN-based scenarios are implemented via $lookup aggregation pipelines.
-- Output CSV schema matches visualization/plot_results.py expectations.
-- Default output filename matches PostgreSQL so plot_results.py works unchanged
-  when called with --results-dir ../mongodb/results.
+- Output CSV schema matches plot_results.py expectations.
+- Default output filename follows the repo convention so plot_results.py can load it
+    automatically when run from the repo root.
 """
 
 from __future__ import annotations
@@ -357,7 +357,7 @@ def save_results_csv(results: list[dict], out_path: str) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "MongoDB READ benchmark suite (6 scenariuszy) – kompatybilny z visualization/plot_results.py."
+            "MongoDB READ benchmark suite (6 scenariuszy) – kompatybilny z plot_results.py."
         )
     )
 

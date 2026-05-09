@@ -96,9 +96,14 @@ Próba wstawienia tego samego tracka dwa razy.
 
 ### S2 — partition_read
 Wszystkie tracki dla albumu.
-- **Cassandra** — `SELECT track_id FROM track_albums WHERE album_id = ? ALLOW FILTERING`
+- **Cassandra** — `SELECT ... FROM track_albums WHERE album_id = ? LIMIT 200`
+	- w trybie `with_indexes` zapytanie działa przez indeks wtórny `idx_track_albums_album_id` na `track_albums(album_id)`
+	- w trybie `no_indexes` skrypt wykonuje fallback z `ALLOW FILTERING`, żeby scenariusz uruchamiał się w obu trybach
 - **PostgreSQL** — `SELECT tracks JOIN track_albums WHERE album_id = ?`
 - Cassandra nie może zrobić JOIN, więc zwraca tylko dane z `track_albums`
+
+Uwaga: fallback z `ALLOW FILTERING` zachowuje sens obciążenia (album_id → lista tracków), ale może być wyraźnie wolniejszy
+i mniej stabilny na większych skalach, bo Cassandra nie ma naturalnego klucza partycji po `album_id` w tej tabeli.
 
 ### S3 — top_n_ranking
 Top-N wpisów chartu posortowanych po dacie.
@@ -108,13 +113,19 @@ Top-N wpisów chartu posortowanych po dacie.
 
 ### S4 — secondary_index_read
 `SELECT tracks WHERE explicit = true LIMIT N` — logicznie identyczny w obu bazach.
-Cassandra wymaga `ALLOW FILTERING` lub indeksu.
+Cassandra:
+- w trybie `with_indexes` używa indeksu wtórnego na `tracks(explicit)` (bez `ALLOW FILTERING`)
+- w trybie `no_indexes` wykonuje fallback z `ALLOW FILTERING`, żeby scenariusz uruchamiał się w obu trybach
 
 ### S5 — local_aggregation
 Średnie tempo/danceability dla artysty.
 - **Cassandra** — N+1 zapytań: najpierw lista tracków artysty, potem `SELECT audio_features` per track, agregacja w Pythonie
 - **PostgreSQL** — jeden `AVG(...) ... JOIN track_artists ... JOIN audio_features WHERE artist_id = ?`
 - Różnica celowa: mierzy brak agregacji server-side w Cassandrze
+
+Uwaga dot. stabilności w trybie `with_indexes`:
+- Indeksy wtórne w Cassandrze po `CREATE INDEX` budują się asynchronicznie na istniejących danych, więc benchmark wykonuje krótki warm-up
+	(małe zapytania po indeksach) zanim zacznie mierzyć czasy.
 
 ### S6 — range_query
 Albumy wydane 2015–2020, LIMIT skalowane.

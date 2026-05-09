@@ -8,10 +8,11 @@ Scenarios (same names as in postgres/benchmark_psql_insert_scenarios.py):
   5. concurrent_inserts
   6. upsert_insert_or_update
 
-Output CSV schema matches visualization/plot_results.py expectations.
-Default output path uses the *same filename* as PostgreSQL so plot_results.py works
-unchanged when called with --results-dir ../mongodb/results.
+Output CSV schema matches plot_results.py expectations.
+Default output filename matches the repo convention (mongodb/results/mongodb_*_benchmark_results.csv),
+so plot_results.py can load it automatically when run from the repo root.
 """
+
 
 from __future__ import annotations
 
@@ -451,7 +452,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
             "MongoDB INSERT benchmark suite (6 scenariuszy) – single, complex, bulk, heavy payload, concurrent, upsert. "
-            "Nazwy scenariuszy i format CSV są kompatybilne z visualization/plot_results.py."
+            "Nazwy scenariuszy i format CSV są kompatybilne z plot_results.py."
         )
     )
 

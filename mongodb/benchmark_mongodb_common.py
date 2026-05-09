@@ -2,7 +2,7 @@
 
 This mirrors the PostgreSQL benchmark scripts structure so that:
 - seeding is reproducible per scale,
-- results can be saved in the same CSV schema expected by visualization/plot_results.py.
+- results can be saved in the same CSV schema expected by plot_results.py.
 
 MongoDB connection defaults match docker-compose.yml (host=localhost, port=27018).
 """

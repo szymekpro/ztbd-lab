@@ -56,6 +56,15 @@ def main() -> int:
         help="Run each benchmark in both modes (no_indexes + with_indexes) into a single CSV.",
     )
 
+    parser.add_argument(
+        "--seed-value",
+        "--seed",
+        dest="seed_value",
+        type=int,
+        default=None,
+        help="Seed for benchmark data/sampling (forwarded to child modules as --seed-value).",
+    )
+
     args = parser.parse_args()
 
     forwarded_args: list[str] = []
@@ -63,6 +72,8 @@ def main() -> int:
         forwarded_args += ["--scales", args.scales]
     if args.both_index_modes:
         forwarded_args.append("--both-index-modes")
+    if args.seed_value is not None:
+        forwarded_args += ["--seed-value", str(args.seed_value)]
 
     mongo_dir = Path(__file__).resolve().parent
     repo_root = mongo_dir.parent

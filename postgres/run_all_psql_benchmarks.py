@@ -14,16 +14,20 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 
-def _run_one(script_path: Path, forwarded_args: list[str]) -> None:
+def _run_one(script_path: Path, forwarded_args: list[str], *, cwd: Path) -> None:
     cmd = [sys.executable, str(script_path), *forwarded_args]
     print(f"\n=== Uruchomiono: {script_path.name} ===")
     print(" ".join(cmd))
-    subprocess.run(cmd, check=True)
+    env = os.environ.copy()
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    env.setdefault("PYTHONUTF8", "1")
+    subprocess.run(cmd, check=True, cwd=str(cwd), env=env)
 
 
 def main() -> int:
@@ -52,6 +56,15 @@ def main() -> int:
         help="Run each benchmark in both modes (no_indexes + with_indexes) into a single CSV.",
     )
 
+    parser.add_argument(
+        "--seed-value",
+        "--seed",
+        dest="seed_value",
+        type=int,
+        default=None,
+        help="Seed for benchmark data/sampling (forwarded to child scripts as --seed-value).",
+    )
+
     args = parser.parse_args()
 
     forwarded_args: list[str] = []
@@ -59,8 +72,11 @@ def main() -> int:
         forwarded_args += ["--scales", args.scales]
     if args.both_index_modes:
         forwarded_args.append("--both-index-modes")
+    if args.seed_value is not None:
+        forwarded_args += ["--seed-value", str(args.seed_value)]
 
     postgres_dir = Path(__file__).resolve().parent
+    repo_root = postgres_dir.parent
 
     scripts = [
         postgres_dir / "benchmark_psql_insert_scenarios.py",
@@ -75,7 +91,7 @@ def main() -> int:
 
     try:
         for script in scripts:
-            _run_one(script, forwarded_args)
+            _run_one(script, forwarded_args, cwd=repo_root)
     except KeyboardInterrupt:
         print("\nInterrupted by user (Ctrl+C).")
         return 130

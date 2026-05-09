@@ -26,6 +26,7 @@ from benchmark_cassandra_common import (
     parse_scales,
     prepare_scale_data_with_seed_script,
     scaled_count,
+    wait_for_secondary_indexes,
 )
 
 
@@ -448,6 +449,9 @@ def run_benchmark(
                     index_label = "with_indexes" if with_indexes else "no_indexes"
                     apply_indexes(session, MANAGED_INDEXES, with_indexes)
 
+                    if with_indexes:
+                        wait_for_secondary_indexes(session, MANAGED_INDEXES, max_total_seconds=600.0, step_seconds=30.0)
+
                     scenario_defs = [
                         ("point_delete", lambda: scenario_point_delete(session, samples)),
                         ("cascade_delete", lambda: scenario_cascade_delete(session, samples)),
@@ -468,7 +472,14 @@ def run_benchmark(
 
                     for scenario_name, scenario_fn in scenario_defs:
                         for run_idx in range(1, runs_per_scenario + 1):
-                            elapsed, ops = scenario_fn()
+                            try:
+                                elapsed, ops = scenario_fn()
+                            except Exception as exc:
+                                print(
+                                    f"[WARN] delete scenario failed: scale={effective_scale}, index_mode={index_label}, "
+                                    f"scenario={scenario_name}, run={run_idx} — {type(exc).__name__}: {exc}"
+                                )
+                                continue
                             results.append(
                                 {
                                     "scale": effective_scale,
@@ -495,6 +506,9 @@ def run_benchmark(
                     index_label = "with_indexes" if with_indexes else "no_indexes"
                     apply_indexes(session, MANAGED_INDEXES, with_indexes)
 
+                    if with_indexes:
+                        wait_for_secondary_indexes(session, MANAGED_INDEXES, max_total_seconds=600.0, step_seconds=30.0)
+
                     scenario_defs = [
                         ("point_delete", lambda: scenario_point_delete(session, samples)),
                         ("cascade_delete", lambda: scenario_cascade_delete(session, samples)),
@@ -515,7 +529,14 @@ def run_benchmark(
 
                     for scenario_name, scenario_fn in scenario_defs:
                         for run_idx in range(1, runs_per_scenario + 1):
-                            elapsed, ops = scenario_fn()
+                            try:
+                                elapsed, ops = scenario_fn()
+                            except Exception as exc:
+                                print(
+                                    f"[WARN] delete scenario failed: scale={effective_scale}, index_mode={index_label}, "
+                                    f"scenario={scenario_name}, run={run_idx} — {type(exc).__name__}: {exc}"
+                                )
+                                continue
                             results.append(
                                 {
                                     "scale": effective_scale,
@@ -606,7 +627,8 @@ def main() -> int:
         action="store_true",
         help=(
             "Jesli uzywasz --both-index-modes: reseeduj (TRUNCATE+seed) baze przed kazdym trybem indeksow. "
-            "Wolniejsze, ale bardziej uczciwe porownanie."
+            "Wolniejsze, ale bardziej uczciwe porownanie. "
+            "Uwaga: gdy podasz --scales oraz --both-index-modes (i nie ustawisz --skip-prepare), skrypt i tak wymusza reseed per tryb."
         ),
     )
     parser.add_argument("--output", default="cassandra/results/cassandra_delete_benchmark_results.csv")
@@ -646,6 +668,13 @@ def main() -> int:
         index_modes = [with_indexes]
         mode_label = "Z indeksami" if with_indexes else "BEZ indeksow"
 
+    # DELETE scenarios mutate the dataset, so running two index modes back-to-back without reseeding
+    # makes the second mode operate on already-deleted data. For fairness and complete results,
+    # force reseeding per index mode when scales are provided.
+    reseed_per_index_mode = args.reseed_per_index_mode
+    if args.both_index_modes and scales and not args.skip_prepare:
+        reseed_per_index_mode = True
+
     print(f"\n>>> Cassandra DELETE Benchmark - tryb: {mode_label} <<<")
 
     if scales and not args.skip_prepare:
@@ -659,7 +688,7 @@ def main() -> int:
         concurrent_workers=args.concurrent_workers,
         concurrent_chunk_size=args.concurrent_chunk_size,
         skip_prepare=args.skip_prepare,
-        reseed_per_index_mode=args.reseed_per_index_mode,
+        reseed_per_index_mode=reseed_per_index_mode,
         seed_value=args.seed_value,
         pool_size=args.pool_size,
     )

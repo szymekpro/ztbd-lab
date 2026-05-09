@@ -4,6 +4,9 @@ import random
 import string
 import sys
 import time as pytime
+import re
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from itertools import islice
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
@@ -45,7 +48,7 @@ def _prepare_cassandra_runtime() -> None:
 
     # Fallback: gevent reactor can also work when asyncore backport is not installed.
     try:
-        from gevent import monkey
+        from gevent import monkey  # type: ignore[import-not-found]
 
         if not monkey.is_module_patched("socket"):
             monkey.patch_all()
@@ -73,9 +76,85 @@ def connect_db(cfg: DbConfig):
         auth_provider = PlainTextAuthProvider(username=cfg.user, password=cfg.password or "")
 
     cluster = Cluster([cfg.host], port=cfg.port, auth_provider=auth_provider)
-    session = cluster.connect()
-    session.set_keyspace(cfg.keyspace)
+
+    # Cassandra in Docker can take a while to start or briefly restart under load.
+    # Retrying here prevents flaky benchmark runs (seed is called before every scale).
+    try:
+        from cassandra.cluster import NoHostAvailable
+    except Exception:  # pragma: no cover
+        NoHostAvailable = Exception  # type: ignore
+
+    last_exc: Optional[Exception] = None
+    session = None
+    for attempt in range(1, 31):
+        try:
+            session = cluster.connect()
+            break
+        except NoHostAvailable as exc:  # type: ignore[misc]
+            last_exc = exc
+            pytime.sleep(min(10.0, 0.5 + attempt * 0.5))
+
+    if session is None:
+        try:
+            cluster.shutdown()
+        finally:
+            raise last_exc if last_exc is not None else RuntimeError("Unable to connect to Cassandra")
+
+    try:
+        session.set_keyspace(cfg.keyspace)
+    except Exception as exc:
+        # First-run convenience: create/init the schema when docker init hasn't run.
+        try:
+            from cassandra import InvalidRequest  # type: ignore
+
+            is_missing_keyspace = isinstance(exc, InvalidRequest) and "does not exist" in str(exc)
+        except Exception:  # pragma: no cover
+            is_missing_keyspace = False
+
+        if not is_missing_keyspace:
+            raise
+
+        _bootstrap_schema_from_repo_init(session, keyspace=cfg.keyspace)
+        session.set_keyspace(cfg.keyspace)
     return cluster, session
+
+
+def _bootstrap_schema_from_repo_init(session, keyspace: str) -> None:
+    init_path = Path(__file__).resolve().parent / "init.cassandra.cql"
+    if not init_path.exists():
+        raise RuntimeError(
+            f"Missing {init_path.name}; cannot auto-create Cassandra schema. "
+            "Start DB with docker-compose so init.cassandra.cql runs."
+        )
+
+    raw = init_path.read_text(encoding="utf-8")
+    # Make the init script work with a custom keyspace name.
+    raw = re.sub(
+        r"(?im)CREATE\s+KEYSPACE\s+IF\s+NOT\s+EXISTS\s+\w+",
+        f"CREATE KEYSPACE IF NOT EXISTS {keyspace}",
+        raw,
+    )
+    raw = re.sub(r"(?im)USE\s+\w+\s*;", f"USE {keyspace};", raw)
+
+    # Strip '-- ...' comments and split into statements.
+    cql = "\n".join(line for line in raw.splitlines() if not line.lstrip().startswith("--"))
+    statements = [stmt.strip() for stmt in cql.split(";") if stmt.strip()]
+
+    print(f"[INIT] Bootstrapping Cassandra schema from {init_path.name} (keyspace={keyspace})")
+
+    post_keyspace: list[str] = []
+    for stmt in statements:
+        if re.match(r"(?is)^USE\s+", stmt):
+            continue
+        if re.match(r"(?is)^CREATE\s+KEYSPACE\s+", stmt):
+            session.execute(stmt)
+        else:
+            post_keyspace.append(stmt)
+
+    session.set_keyspace(keyspace)
+    for stmt in post_keyspace:
+        session.execute(stmt)
+    print("[INIT] Cassandra schema ready")
 
 
 _BASE62 = string.digits + string.ascii_letters
@@ -126,9 +205,21 @@ def ensure_schema(session, keyspace: str) -> None:
         (keyspace,),
     ).one()
     if row is None:
-        raise RuntimeError(
-            "Schema not found (missing spotify.tracks table). Start DB with docker-compose so init.cassandra.cql runs."
-        )
+        # Try bootstrapping automatically (helps when init script wasn't executed).
+        _bootstrap_schema_from_repo_init(session, keyspace=keyspace)
+        row = session.execute(
+            """
+            SELECT table_name
+            FROM system_schema.tables
+            WHERE keyspace_name = %s AND table_name = 'tracks'
+            """,
+            (keyspace,),
+        ).one()
+        if row is None:
+            raise RuntimeError(
+                "Schema not found (missing tracks table). "
+                "Start DB with docker-compose or run init.cassandra.cql manually."
+            )
 
 
 _SEED_RETRY_ATTEMPTS = 4
@@ -395,76 +486,122 @@ def seed_relations(
     genres_per_artist: int = 2,
     artists_per_album: int = 1,
     artists_per_track: int = 2,
+    parallel_workers: int = 1,
 ) -> None:
-    if n_artists > 0 and n_genres > 0:
-        def artist_genres_rows() -> Iterable[Sequence[object]]:
-            for artist_id in range(1, n_artists + 1):
-                for gs in range(1, max(1, genres_per_artist) + 1):
-                    genre_id = ((artist_id + gs - 2) % n_genres) + 1
-                    yield (artist_id, genre_id)
+    tasks: list[tuple[str, str, callable[[], Iterable[Sequence[object]]]]] = []
 
-        insert_many(
-            session,
-            "INSERT INTO artist_genres (artist_id, genre_id) VALUES (?, ?)",
-            artist_genres_rows(),
-            tuning,
-            "artist_genres",
-        )
+    def ceil_div(n: int, d: int) -> int:
+        return (n + d - 1) // d
+
+    def id_ranges(total: int, per_range: int) -> Iterable[tuple[int, int]]:
+        if total <= 0:
+            return
+        step = max(1, int(per_range))
+        for start_id in range(1, total + 1, step):
+            end_id = min(total, start_id + step - 1)
+            yield start_id, end_id
+
+    requested_workers = max(1, int(parallel_workers))
+    # Aim for enough tasks to keep workers busy, but keep ranges reasonably large.
+    desired_ranges = max(1, requested_workers * 4)
+    min_ids_per_task = 10_000
+
+    artist_range_size = max(min_ids_per_task, ceil_div(n_artists, desired_ranges)) if n_artists > 0 else 0
+    album_range_size = max(min_ids_per_task, ceil_div(n_albums, desired_ranges)) if n_albums > 0 else 0
+    track_range_size = max(min_ids_per_task, ceil_div(n_tracks, desired_ranges)) if n_tracks > 0 else 0
+
+    if n_artists > 0 and n_genres > 0:
+        cql = "INSERT INTO artist_genres (artist_id, genre_id) VALUES (?, ?)"
+        for start_id, end_id in id_ranges(n_artists, artist_range_size):
+            label = "artist_genres" if start_id == 1 and end_id == n_artists else f"artist_genres[{start_id}-{end_id}]"
+
+            def rows_fn(start_id: int = start_id, end_id: int = end_id) -> Iterable[Sequence[object]]:
+                for artist_id in range(start_id, end_id + 1):
+                    for gs in range(1, max(1, genres_per_artist) + 1):
+                        genre_id = ((artist_id + gs - 2) % n_genres) + 1
+                        yield (artist_id, genre_id)
+
+            tasks.append((label, cql, rows_fn))
 
     if n_albums > 0 and n_artists > 0:
-        def album_artists_rows() -> Iterable[Sequence[object]]:
-            for album_id in range(1, n_albums + 1):
-                for gs in range(1, max(1, artists_per_album) + 1):
-                    artist_id = ((album_id + gs - 2) % n_artists) + 1
-                    yield (album_id, artist_id, gs)
+        cql = "INSERT INTO album_artists (album_id, artist_id, artist_order) VALUES (?, ?, ?)"
+        for start_id, end_id in id_ranges(n_albums, album_range_size):
+            label = "album_artists" if start_id == 1 and end_id == n_albums else f"album_artists[{start_id}-{end_id}]"
 
-        insert_many(
-            session,
-            "INSERT INTO album_artists (album_id, artist_id, artist_order) VALUES (?, ?, ?)",
-            album_artists_rows(),
-            tuning,
-            "album_artists",
-        )
+            def rows_fn(start_id: int = start_id, end_id: int = end_id) -> Iterable[Sequence[object]]:
+                for album_id in range(start_id, end_id + 1):
+                    for gs in range(1, max(1, artists_per_album) + 1):
+                        artist_id = ((album_id + gs - 2) % n_artists) + 1
+                        yield (album_id, artist_id, gs)
+
+            tasks.append((label, cql, rows_fn))
 
     if n_tracks > 0 and n_artists > 0:
-        def track_artists_rows() -> Iterable[Sequence[object]]:
-            for track_id in range(1, n_tracks + 1):
-                for gs in range(1, max(1, artists_per_track) + 1):
-                    artist_id = ((track_id + gs - 2) % n_artists) + 1
-                    yield (track_id, artist_id, gs)
+        cql = "INSERT INTO track_artists (track_id, artist_id, artist_order) VALUES (?, ?, ?)"
+        for start_id, end_id in id_ranges(n_tracks, track_range_size):
+            label = "track_artists" if start_id == 1 and end_id == n_tracks else f"track_artists[{start_id}-{end_id}]"
 
-        insert_many(
-            session,
-            "INSERT INTO track_artists (track_id, artist_id, artist_order) VALUES (?, ?, ?)",
-            track_artists_rows(),
-            tuning,
-            "track_artists",
-        )
+            def rows_fn(start_id: int = start_id, end_id: int = end_id) -> Iterable[Sequence[object]]:
+                for track_id in range(start_id, end_id + 1):
+                    for gs in range(1, max(1, artists_per_track) + 1):
+                        artist_id = ((track_id + gs - 2) % n_artists) + 1
+                        yield (track_id, artist_id, gs)
+
+            tasks.append((label, cql, rows_fn))
 
     if n_tracks > 0 and n_albums > 0:
-        def track_albums_rows() -> Iterable[Sequence[object]]:
-            for track_id in range(1, n_tracks + 1):
-                album_id = ((track_id - 1) % n_albums) + 1
-                yield (track_id, album_id, True)
+        cql = "INSERT INTO track_albums (track_id, album_id, is_primary) VALUES (?, ?, ?)"
+        for start_id, end_id in id_ranges(n_tracks, track_range_size):
+            label = "track_albums" if start_id == 1 and end_id == n_tracks else f"track_albums[{start_id}-{end_id}]"
 
-        insert_many(
-            session,
-            "INSERT INTO track_albums (track_id, album_id, is_primary) VALUES (?, ?, ?)",
-            track_albums_rows(),
-            tuning,
-            "track_albums",
-        )
+            def rows_fn(start_id: int = start_id, end_id: int = end_id) -> Iterable[Sequence[object]]:
+                for track_id in range(start_id, end_id + 1):
+                    album_id = ((track_id - 1) % n_albums) + 1
+                    yield (track_id, album_id, True)
+
+            tasks.append((label, cql, rows_fn))
+
+    if not tasks:
+        return
+
+    max_workers = requested_workers
+    max_workers = min(max_workers, len(tasks))
+    if max_workers <= 1:
+        for label, cql, rows_fn in tasks:
+            insert_many(session, cql, rows_fn(), tuning, label)
+        return
+
+    per_task_concurrency = max(1, tuning.concurrency // max_workers)
+    task_tuning = WriteTuning(
+        concurrency=per_task_concurrency,
+        chunk_size=tuning.chunk_size,
+        progress_every=tuning.progress_every,
+    )
+    print(
+        f"[SEED] relations: parallel workers={max_workers}, tasks={len(tasks)}, per-task concurrency={per_task_concurrency} "
+        f"(total budget≈{per_task_concurrency * max_workers})"
+    )
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = [pool.submit(insert_many, session, cql, rows_fn(), task_tuning, label) for label, cql, rows_fn in tasks]
+        for fut in as_completed(futures):
+            fut.result()
 
 
-def seed_audio_features(session, n_tracks: int, seed: Optional[int], tuning: WriteTuning) -> None:
+def seed_audio_features(
+    session,
+    n_tracks: int,
+    seed: Optional[int],
+    tuning: WriteTuning,
+    parallel_workers: int = 1,
+    batch_tracks: int = 0,
+) -> None:
     if n_tracks <= 0:
         return
 
-    def rows() -> Iterable[Sequence[object]]:
+    def rows_range(start_id: int, end_id: int) -> Iterable[Sequence[object]]:
         decimal_fn = _decimal
-        for track_id in range(1, n_tracks + 1):
-            # Deterministic pseudo-random values derived from track_id.
-            # Much faster than calling Python RNG ~10+ times per row at large scales.
+        for track_id in range(start_id, end_id + 1):
             u01a = ((track_id * 1103515245 + 12345) % 1000) / 1000.0
             u01b = ((track_id * 1103515245 + 67890) % 1000) / 1000.0
             u01c = ((track_id * 1103515245 + 44444) % 1000) / 1000.0
@@ -487,18 +624,59 @@ def seed_audio_features(session, n_tracks: int, seed: Optional[int], tuning: Wri
                 [3, 4, 5][(track_id * 1103515245 + 13579) % 3],
             )
 
-    insert_many(
-        session,
-        """
+    cql = """
         INSERT INTO audio_features (
           track_id, danceability, energy, "key", mode, loudness, speechiness,
           acousticness, instrumentalness, liveness, valence, tempo, time_signature
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        rows(),
-        tuning,
-        "audio_features",
+        """
+
+    max_workers = max(1, int(parallel_workers))
+    if max_workers <= 1:
+        insert_many(session, cql, rows_range(1, n_tracks), tuning, "audio_features")
+        return
+
+    def ceil_div(n: int, d: int) -> int:
+        return (n + d - 1) // d
+
+    # Auto mode: choose tracks/batch to create enough batches to keep workers busy.
+    if int(batch_tracks) > 0:
+        tracks_per_batch = int(batch_tracks)
+        auto = False
+    else:
+        desired_batches = max(1, max_workers * 4)
+        suggested = ceil_div(n_tracks, desired_batches)
+        min_batch = max(1_000, min(5_000, tuning.chunk_size))
+        max_batch = max(50_000, tuning.chunk_size * 10)
+        tracks_per_batch = max(min_batch, min(max_batch, suggested))
+        auto = True
+
+    batches: list[tuple[int, int]] = []
+    for start_id in range(1, n_tracks + 1, tracks_per_batch):
+        end_id = min(n_tracks, start_id + tracks_per_batch - 1)
+        batches.append((start_id, end_id))
+
+    max_workers = min(max_workers, len(batches))
+    per_task_concurrency = max(1, tuning.concurrency // max_workers)
+    task_tuning = WriteTuning(
+        concurrency=per_task_concurrency,
+        chunk_size=tuning.chunk_size,
+        # Avoid extremely noisy logs from many batches.
+        progress_every=0,
     )
+    print(
+        f"[SEED] audio_features: parallel workers={max_workers}, batches={len(batches)}, "
+        f"tracks/batch={tracks_per_batch}{' (auto)' if auto else ''}, per-task concurrency={per_task_concurrency} "
+        f"(total budget≈{per_task_concurrency * max_workers})"
+    )
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = [
+            pool.submit(insert_many, session, cql, rows_range(start_id, end_id), task_tuning, f"audio_features[{start_id}-{end_id}]")
+            for start_id, end_id in batches
+        ]
+        for fut in as_completed(futures):
+            fut.result()
 
 
 def seed_charts(session, n_markets: int, tuning: WriteTuning) -> list[int]:
@@ -572,6 +750,9 @@ def seed_all(
     write_tuning: WriteTuning = WriteTuning(),
     fast_mode: bool = False,
     include_audio_features: bool = True,
+    relations_workers: int = 4,
+    audio_features_workers: int = 4,
+    audio_features_batch_tracks: int = 0,
 ) -> None:
     fake = Faker()
     if seed is not None:
@@ -596,11 +777,19 @@ def seed_all(
         n_tracks=track_count,
         tuning=write_tuning,
         artists_per_track=artists_per_track,
+        parallel_workers=max(1, int(relations_workers)),
     )
 
     _seed_audio = include_audio_features and not fast_mode
     if _seed_audio:
-        seed_audio_features(session, n_tracks=track_count, seed=seed, tuning=write_tuning)
+        seed_audio_features(
+            session,
+            n_tracks=track_count,
+            seed=seed,
+            tuning=write_tuning,
+            parallel_workers=max(1, int(audio_features_workers)),
+            batch_tracks=max(0, int(audio_features_batch_tracks)),
+        )
 
     chart_ids = seed_charts(session, market_count, tuning=write_tuning)
     if not fast_mode:
@@ -656,6 +845,34 @@ def main() -> int:
         help="Faster mode: fewer heavy writes (artists_per_track=1, skips audio_features and chart_entries).",
     )
 
+    parser.add_argument(
+        "--relations-workers",
+        type=int,
+        default=int(os.getenv("RELATIONS_WORKERS", "12")),
+        help=(
+            "Parallel workers for relation tables (artist_genres/album_artists/track_artists/track_albums). "
+            "Total driver concurrency budget is split across workers. Set 1 to disable parallelism."
+        ),
+    )
+    parser.add_argument(
+        "--audio-workers",
+        type=int,
+        default=int(os.getenv("AUDIO_WORKERS", "12")),
+        help=(
+            "Parallel workers for audio_features batches. Total driver concurrency budget is split across workers. "
+            "Set 1 to disable parallelism."
+        ),
+    )
+    parser.add_argument(
+        "--audio-batch-tracks",
+        type=int,
+        default=int(os.getenv("AUDIO_BATCH_TRACKS", "0")),
+        help=(
+            "How many tracks per audio_features batch when --audio-workers>1. "
+            "0 = auto (aims for ~4 batches per worker; bounded by write_chunk_size and a safe min/max)."
+        ),
+    )
+
     parser.add_argument("--db-host", default=os.getenv("DB_HOST", "localhost"))
     parser.add_argument("--db-port", type=int, default=int(os.getenv("DB_PORT", "9043")))
     parser.add_argument("--db-keyspace", default=os.getenv("DB_KEYSPACE", "spotify"))
@@ -693,6 +910,9 @@ def main() -> int:
             pool_size=args.pool_size,
             write_tuning=write_tuning,
             fast_mode=args.fast,
+            relations_workers=args.relations_workers,
+            audio_features_workers=args.audio_workers,
+            audio_features_batch_tracks=args.audio_batch_tracks,
         )
     finally:
         if session is not None:

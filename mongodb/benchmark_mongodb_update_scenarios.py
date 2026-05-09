@@ -12,9 +12,9 @@ Notes:
 - SQL subqueries / JOIN updates are approximated with aggregations + update_many.
 - list_append uses insert into artist_genres (unique compound index) which is
   the closest equivalent to an "append to collection" in this schema.
-- Output CSV schema matches visualization/plot_results.py expectations.
-- Default output filename matches PostgreSQL so plot_results.py works unchanged
-  when called with --results-dir ../mongodb/results.
+- Output CSV schema matches plot_results.py expectations.
+- Default output filename follows the repo convention so plot_results.py can load it
+    automatically when run from the repo root.
 """
 
 from __future__ import annotations
@@ -394,7 +394,7 @@ def save_results_csv(results: list[dict], out_path: str) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="MongoDB UPDATE benchmark suite (6 scenariuszy) – kompatybilny z visualization/plot_results.py."
+        description="MongoDB UPDATE benchmark suite (6 scenariuszy) – kompatybilny z plot_results.py."
     )
 
     parser.add_argument("--scales", default="500000,1000000,10000000")

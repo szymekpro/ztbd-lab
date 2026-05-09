@@ -9,6 +9,8 @@ from decimal import Decimal
 from statistics import mean
 from typing import Optional
 
+from cassandra import InvalidRequest
+
 from benchmark_cassandra_common import (
     DbConfig,
     apply_indexes,
@@ -19,6 +21,7 @@ from benchmark_cassandra_common import (
     prepare_scale_data_with_seed_script,
     scaled_count,
     timed_run,
+    wait_for_secondary_indexes,
 )
 
 
@@ -113,17 +116,31 @@ def scenario_point_read(session, samples: dict) -> int:
 
 def scenario_partition_read(session, samples: dict) -> int:
     album_id = random.choice(samples["album_ids"])
-    rel_rows = list(
-        session.execute(
-            """
-            SELECT track_id, album_id, is_primary
-            FROM track_albums
-            WHERE album_id = %s
-            ALLOW FILTERING
-            """,
-            (album_id,),
+    try:
+        rel_rows = list(
+            session.execute(
+                """
+                SELECT track_id, album_id, is_primary
+                FROM track_albums
+                WHERE album_id = %s
+                LIMIT 200
+                """,
+                (album_id,),
+            )
         )
-    )
+    except InvalidRequest:
+        rel_rows = list(
+            session.execute(
+                """
+                SELECT track_id, album_id, is_primary
+                FROM track_albums
+                WHERE album_id = %s
+                LIMIT 200
+                ALLOW FILTERING
+                """,
+                (album_id,),
+            )
+        )
     return len(rel_rows)
 
 
@@ -147,35 +164,61 @@ def scenario_top_n_ranking_scaled(session, samples: dict, scale: int) -> int:
 
 def scenario_secondary_index_read_scaled(session, _samples: dict, scale: int) -> int:
     limit_n = scaled_count(scale, 0.001, min_count=1_000, max_count=50_000)
-    rows = list(
-        session.execute(
-            """
-            SELECT track_id, name, duration_min
-            FROM tracks
-            WHERE explicit = true
-            LIMIT %s
-            ALLOW FILTERING
-            """,
-            (limit_n,),
+    try:
+        rows = list(
+            session.execute(
+                """
+                SELECT track_id, name, duration_min
+                FROM tracks
+                WHERE explicit = true
+                LIMIT %s
+                """,
+                (limit_n,),
+            )
         )
-    )
+    except InvalidRequest:
+        rows = list(
+            session.execute(
+                """
+                SELECT track_id, name, duration_min
+                FROM tracks
+                WHERE explicit = true
+                LIMIT %s
+                ALLOW FILTERING
+                """,
+                (limit_n,),
+            )
+        )
     return len(rows)
 
 
 def scenario_local_aggregation(session, samples: dict) -> int:
     artist_id = random.choice(samples["artist_ids"])
-    links = list(
-        session.execute(
-            """
-            SELECT track_id
-            FROM track_artists
-            WHERE artist_id = %s
-            LIMIT 5000
-            ALLOW FILTERING
-            """,
-            (artist_id,),
+    try:
+        links = list(
+            session.execute(
+                """
+                SELECT track_id
+                FROM track_artists
+                WHERE artist_id = %s
+                LIMIT 200
+                """,
+                (artist_id,),
+            )
         )
-    )
+    except InvalidRequest:
+        links = list(
+            session.execute(
+                """
+                SELECT track_id
+                FROM track_artists
+                WHERE artist_id = %s
+                LIMIT 200
+                ALLOW FILTERING
+                """,
+                (artist_id,),
+            )
+        )
 
     if not links:
         return 0
@@ -259,6 +302,9 @@ def run_benchmark(
                 apply_indexes(session, MANAGED_INDEXES, with_indexes)
                 index_label = "with_indexes" if with_indexes else "no_indexes"
 
+                if with_indexes:
+                    wait_for_secondary_indexes(session, MANAGED_INDEXES, max_total_seconds=600.0, step_seconds=30.0)
+
                 scenarios = [
                     ("point_read", lambda: scenario_point_read(session, samples)),
                     ("partition_read", lambda: scenario_partition_read(session, samples)),
@@ -270,7 +316,15 @@ def run_benchmark(
 
                 for scenario_name, scenario_fn in scenarios:
                     for run_idx in range(1, runs_per_scenario + 1):
-                        elapsed, ops = timed_run(scenario_fn)
+                        try:
+                            elapsed, ops = timed_run(scenario_fn)
+                        except Exception as exc:
+                            print(
+                                f"[WARN] read scenario failed: scale={scale}, index_mode={index_label}, "
+                                f"scenario={scenario_name}, run={run_idx} — {type(exc).__name__}: {exc}"
+                            )
+                            continue
+
                         results.append(
                             {
                                 "scale": scale,
